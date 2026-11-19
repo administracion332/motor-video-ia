@@ -8,20 +8,17 @@ jobs:
   build-videos:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout código
+        uses: actions/checkout@v4
 
       - name: Instalar FFmpeg y Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Instalar dependencias
         run: |
-          sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu-core
-          pip install edge-tts requests pillow
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-dejavu-core
+          python3 -m pip install --upgrade pip
+          pip install requests pillow faster-whisper auto-editor
 
-      - name: Ejecutar renderizado
+      - name: Ejecutar edición IA y renderizado
         env:
-          PAYLOAD_JSON: ${{ toJson(github.event.client_payload) }}
           APPS_SCRIPT_URL: ${{ secrets.APPS_SCRIPT_URL }}
-        run: python render_video.py
+        run: python3 render_video.py
