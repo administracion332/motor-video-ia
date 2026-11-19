@@ -1,168 +1,206 @@
-import os
-import json
 import base64
-import asyncio
+import json
+import os
 import subprocess
+import sys
 import textwrap
+from pathlib import Path
+
 import requests
-import edge_tts
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
-payload = json.loads(os.environ["PAYLOAD_JSON"])
-apps_script_url = os.environ["APPS_SCRIPT_URL"]
 
-row_id = payload["id"]
-producto = payload.get("producto", "")
-precio = payload.get("precio", "")
-gancho = payload.get("gancho", "")
-guion = payload.get("guion", "")
-imagenes_urls = payload.get("imagenes", [])
-clips_b64 = payload.get("clips_b64", [])
+def run_cmd(cmd):
+    subprocess.run(cmd, check=True)
 
-os.makedirs("work", exist_ok=True)
 
-# 1. Generar voz en off natural (Voz argentina masculina: es-AR-TomasNeural | Femenina: es-AR-ElenaNeural)
-async def crear_voz():
-    communicate = edge_tts.Communicate(guion, "es-AR-TomasNeural", rate="+6%")
-    await communicate.save("work/voz.mp3")
+def get_audio_duration(audio_path):
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(audio_path),
+    ]
+    res = subprocess.check_output(cmd).decode("utf-8").strip()
+    return max(float(res), 5.0)
 
-asyncio.run(crear_voz())
 
-# Obtener duración exacta del audio
-probe = subprocess.check_output([
-    "ffprobe", "-v", "error", "-show_entries", "format=duration",
-    "-of", "default=noprint_wrappers=1:nokey=1", "work/voz.mp3"
-]).decode().strip()
-duracion_total = max(float(probe), 6.0)
+def generate_tts(text, out_path):
+    for voice in ["es-AR-TomasNeural", "es-MX-JorgeNeural"]:
+        try:
+            run_cmd(["edge-tts", "--voice", voice, "--text", text, "--write-media", str(out_path)])
+            if out_path.exists() and out_path.stat().st_size > 1000:
+                return
+        except Exception as e:
+            print(f"Fallo voz {voice}: {e}")
+    raise RuntimeError("No se pudo generar el audio con edge-tts.")
 
-# 2. Crear placa gráfica transparente con Gancho arriba y Producto/Precio abajo
-def crear_overlay(width, height, filename):
-    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
+
+def main():
+    raw_payload = (
+        os.environ.get("PAYLOAD")
+        or os.environ.get("CLIENT_PAYLOAD")
+        or (sys.argv[1] if len(sys.argv) > 1 else "{}")
+    )
+    payload = json.loads(raw_payload)
+    apps_script_url = os.environ.get("APPS_SCRIPT_URL") or os.environ.get("WEBHOOK_URL", "")
+
+    row_id = payload.get("id", "VID-TEST")
+    producto = str(payload.get("producto", "Oferta Destacada")).strip()
+    precio = str(payload.get("precio", "")).strip()
+    gancho = str(payload.get("gancho", "")).strip()
+    guion = str(payload.get("guion", "")).strip() or f"Conocé {producto}. {gancho}"
+    imagenes_urls = payload.get("imagenes") or []
+    clips_b64 = payload.get("clips_b64") or []
+
+    work = Path("/tmp/render_work")
+    work.mkdir(parents=True, exist_ok=True)
+
+    # 1. Generar locución y medir duración exacta
+    voz_path = work / "voz.mp3"
+    generate_tts(guion, voz_path)
+    duracion_total = round(get_audio_duration(voz_path) + 0.6, 2)
+    print(f"Duración objetivo del video: {duracion_total}s")
+
+    # 2. Preparar recursos visuales (clips propios o fotos de Tiendanube)
+    visuales = []
+
+    for idx, b64 in enumerate(clips_b64):
+        try:
+            clip_path = work / f"clip_{idx}.mp4"
+            clip_path.write_bytes(base64.b64decode(b64))
+            visuales.append(("video", clip_path))
+        except Exception as e:
+            print(f"Error decodificando clip {idx}: {e}")
+
+    if not visuales:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        for idx, url in enumerate(imagenes_urls[:4]):
+            try:
+                r = requests.get(url, headers=headers, timeout=15)
+                if r.status_code == 200 and len(r.content) > 1000:
+                    raw_img = work / f"raw_{idx}"
+                    raw_img.write_bytes(r.content)
+                    clean_jpg = work / f"img_{idx}.jpg"
+                    with Image.open(raw_img) as im:
+                        im.convert("RGB").save(clean_jpg, "JPEG", quality=92)
+                    visuales.append(("image", clean_jpg))
+            except Exception as e:
+                print(f"Error descargando imagen {url}: {e}")
+
+    if not visuales:
+        fallback_jpg = work / "fallback.jpg"
+        Image.new("RGB", (1080, 1920), (20, 26, 38)).save(fallback_jpg, "JPEG")
+        visuales.append(("image", fallback_jpg))
+
+    # 3. Crear segmentos normalizados de duración exacta (evita bucles infinitos)
+    seg_dur = round(duracion_total / len(visuales), 3)
+    seg_files = []
+    vf_base = (
+        "scale=1080:1920:force_original_aspect_ratio=decrease,"
+        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=#111827,"
+        "fps=30,format=yuv420p"
+    )
+
+    for idx, (tipo, path) in enumerate(visuales):
+        seg_out = work / f"seg_{idx}.mp4"
+        if tipo == "video":
+            cmd = [
+                "ffmpeg", "-y", "-stream_loop", "-1", "-i", str(path),
+                "-t", str(seg_dur), "-vf", vf_base,
+                "-c:v", "libx264", "-preset", "ultrafast", "-an", str(seg_out)
+            ]
+        else:
+            cmd = [
+                "ffmpeg", "-y", "-loop", "1", "-i", str(path),
+                "-t", str(seg_dur), "-vf", vf_base,
+                "-c:v", "libx264", "-preset", "ultrafast", "-an", str(seg_out)
+            ]
+        run_cmd(cmd)
+        seg_files.append(seg_out)
+
+    concat_list = work / "concat.txt"
+    concat_list.write_text("\n".join([f"file '{p}'" for p in seg_files]), encoding="utf-8")
+
+    base_916 = work / "base_916.mp4"
+    run_cmd([
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
+        "-t", str(duracion_total), "-c", "copy", str(base_916)
+    ])
+
+    # 4. Exportar Formato 1: Instagram Reels / TikTok (1080x1920) con textos + voz
+    gancho_txt = work / "gancho.txt"
+    pie_txt = work / "pie.txt"
+    gancho_txt.write_text(textwrap.fill(gancho[:70], width=28), encoding="utf-8")
+    pie_label = f"{producto[:40]}\n{precio}".strip()
+    pie_txt.write_text(textwrap.fill(pie_label, width=32), encoding="utf-8")
+
     font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-    f_hook = ImageFont.truetype(font_path, int(height * 0.026))
-    f_prod = ImageFont.truetype(font_path, int(height * 0.021))
-    f_price = ImageFont.truetype(font_path, int(height * 0.032))
+    out_ig = work / "out_ig.mp4"
 
-    # Caja superior (Gancho)
-    if gancho:
-        lines = textwrap.wrap(gancho.upper(), width=26 if width < height else 45)[:3]
-        box_h = len(lines) * int(height * 0.034) + 36
-        y0 = int(height * 0.08)
-        draw.rounded_rectangle([40, y0, width - 40, y0 + box_h], radius=20, fill=(255, 204, 0, 235))
-        for idx, line in enumerate(lines):
-            draw.text((65, y0 + 18 + idx * int(height * 0.034)), line, font=f_hook, fill=(15, 23, 42, 255))
-
-    # Caja inferior (Producto + Precio)
-    y_bot = int(height * 0.78) if width < height else int(height * 0.76)
-    draw.rounded_rectangle([40, y_bot, width - 40, y_bot + int(height * 0.11)], radius=20, fill=(15, 23, 42, 225))
-    draw.text((65, y_bot + 16), producto[:38], font=f_prod, fill=(255, 255, 255, 255))
-    draw.text((65, y_bot + 16 + int(height * 0.042)), precio, font=f_price, fill=(74, 222, 128, 255))
-
-    img.save(filename)
-
-crear_overlay(1080, 1920, "work/overlay_v.png")
-crear_overlay(1920, 1080, "work/overlay_h.png")
-
-# 3. Preparar segmentos visuales (Clips propios si es Híbrido + Fotos de Tiendanube)
-segmentos = []
-
-for i, b64_str in enumerate(clips_b64):
-    clip_path = f"work/clip_{i}.mp4"
-    with open(clip_path, "wb") as f:
-        f.write(base64.b64decode(b64_str))
-    norm_path = f"work/seg_clip_{i}.mp4"
-    subprocess.run([
-        "ffmpeg", "-y", "-i", clip_path, "-t", "6",
-        "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30",
-        "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", norm_path
-    ], check=True)
-    segmentos.append(norm_path)
-
-# Completar con fotos de Tiendanube si faltan segundos o si es modo Automático
-fotos_locales = []
-for i, url in enumerate(imagenes_urls[:4]):
     try:
-        r = requests.get(url, timeout=15)
-        if r.status_code == 200:
-            p = f"work/img_{i}.jpg"
-            with open(p, "wb") as f:
-                f.write(r.content)
-            fotos_locales.append(p)
-    except Exception:
-        pass
-
-if not segmentos and not fotos_locales:
-    img_fallback = Image.new("RGB", (1080, 1920), (30, 58, 76))
-    img_fallback.save("work/fallback.jpg")
-    fotos_locales.append("work/fallback.jpg")
-
-if fotos_locales:
-    seg_dur = max(duracion_total / max(len(fotos_locales), 1), 3.0)
-    frames = int(seg_dur * 30)
-    for i, img_p in enumerate(fotos_locales):
-        norm_path = f"work/seg_img_{i}.mp4"
-        # Fondo difuminado + producto centrado con zoom suave
-        filtro = (
-            f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=25:5[bg];"
-            f"[0:v]scale=980:980:force_original_aspect_ratio=decrease,"
-            f"zoompan=z='min(zoom+0.0012,1.15)':d={frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=980x980[fg];"
-            f"[bg][fg]overlay=(W-w)/2:(H-h)/2,fps=30"
+        draw_filters = (
+            f"drawtext=fontfile={font_path}:textfile={gancho_txt}:fontcolor=black:fontsize=44:"
+            f"box=1:boxcolor=#FACC15@0.95:boxborderw=20:x=(w-text_w)/2:y=150,"
+            f"drawtext=fontfile={font_path}:textfile={pie_txt}:fontcolor=white:fontsize=40:"
+            f"box=1:boxcolor=#0F172A@0.88:boxborderw=20:x=(w-text_w)/2:y=h-text_h-180"
         )
-        subprocess.run([
-            "ffmpeg", "-y", "-loop", "1", "-t", str(seg_dur), "-i", img_p,
-            "-filter_complex", filtro, "-c:v", "libx264", "-pix_fmt", "yuv420p", norm_path
-        ], check=True)
-        segmentos.append(norm_path)
+        run_cmd([
+            "ffmpeg", "-y", "-i", str(base_916), "-i", str(voz_path),
+            "-t", str(duracion_total), "-vf", draw_filters,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k", "-shortest", str(out_ig)
+        ])
+    except Exception as e:
+        print(f"Renderizando sin drawtext por respaldo: {e}")
+        run_cmd([
+            "ffmpeg", "-y", "-i", str(base_916), "-i", str(voz_path),
+            "-t", str(duracion_total),
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k", "-shortest", str(out_ig)
+        ])
 
-# Unir segmentos en bucle hasta cubrir la duración del audio
-with open("work/concat.txt", "w") as f:
-    for _ in range(4):
-        for s in segmentos:
-            f.write(f"file '{os.path.abspath(s)}'\n")
+    # 5. Exportar Formato 2: YouTube Horizontal (1920x1080) con fondo difuminado
+    out_yt = work / "out_yt.mp4"
+    yt_filter = (
+        "[0:v]split=2[bg][fg];"
+        "[bg]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,boxblur=20:5[b];"
+        "[fg]scale=-2:1080[f];"
+        "[b][f]overlay=(W-w)/2:(H-h)/2"
+    )
+    run_cmd([
+        "ffmpeg", "-y", "-i", str(out_ig),
+        "-t", str(duracion_total), "-filter_complex", yt_filter,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "copy", str(out_yt)
+    ])
 
-subprocess.run([
-    "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "work/concat.txt",
-    "-t", str(duracion_total), "-c:v", "libx264", "-pix_fmt", "yuv420p", "work/base_vertical.mp4"
-], check=True)
+    # 6. Exportar Formato 3: WhatsApp Estados ligero (720x1280)
+    out_wa = work / "out_wa.mp4"
+    run_cmd([
+        "ffmpeg", "-y", "-i", str(out_ig),
+        "-t", str(duracion_total), "-vf", "scale=720:1280",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "28",
+        "-c:a", "aac", "-b:a", "96k", str(out_wa)
+    ])
 
-# 4. Exportar las 3 versiones finales
-# Versión 1: Instagram Reels & TikTok (1080x1920 HD)
-subprocess.run([
-    "ffmpeg", "-y", "-i", "work/base_vertical.mp4", "-i", "work/overlay_v.png", "-i", "work/voz.mp3",
-    "-filter_complex", "[0:v][1:v]overlay=0:0[v]",
-    "-map", "[v]", "-map", "2:a", "-c:v", "libx264", "-crf", "23", "-c:a", "aac", "-shortest",
-    "work/ig_tiktok.mp4"
-], check=True)
+    # 7. Enviar los 3 MP4 de vuelta a Apps Script -> Google Drive
+    if not apps_script_url:
+        raise RuntimeError("Falta configurar el secreto APPS_SCRIPT_URL en GitHub.")
 
-# Versión 2: YouTube Horizontal (1920x1080 con fondo difuminado elegante)
-subprocess.run([
-    "ffmpeg", "-y", "-i", "work/base_vertical.mp4", "-i", "work/overlay_h.png", "-i", "work/voz.mp3",
-    "-filter_complex",
-    "[0:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,boxblur=30:8[bg];"
-    "[0:v]scale=-1:1080[fg];[bg][fg]overlay=(W-w)/2:0[vid];[vid][1:v]overlay=0:0[v]",
-    "-map", "[v]", "-map", "2:a", "-c:v", "libx264", "-crf", "23", "-c:a", "aac", "-shortest",
-    "work/youtube.mp4"
-], check=True)
+    resp_payload = {
+        "accion": "guardar_videos",
+        "id": row_id,
+        "ig_tiktok_b64": base64.b64encode(out_ig.read_bytes()).decode("utf-8"),
+        "youtube_b64": base64.b64encode(out_yt.read_bytes()).decode("utf-8"),
+        "whatsapp_b64": base64.b64encode(out_wa.read_bytes()).decode("utf-8"),
+    }
 
-# Versión 3: WhatsApp (720x1280 ultraliviano para Estados y chats)
-subprocess.run([
-    "ffmpeg", "-y", "-i", "work/ig_tiktok.mp4",
-    "-vf", "scale=720:1280", "-r", "24", "-c:v", "libx264", "-crf", "29", "-b:a", "96k",
-    "work/whatsapp.mp4"
-], check=True)
+    res = requests.post(apps_script_url, json=resp_payload, timeout=120, allow_redirects=True)
+    print(f"Respuesta Apps Script ({res.status_code}): {res.text}")
+    res.raise_for_status()
 
-# 5. Enviar los 3 videos terminados de vuelta a tu Google Drive vía Apps Script
-def to_b64(path):
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
 
-respuesta = {
-    "accion": "guardar_videos",
-    "id": row_id,
-    "ig_tiktok_b64": to_b64("work/ig_tiktok.mp4"),
-    "youtube_b64": to_b64("work/youtube.mp4"),
-    "whatsapp_b64": to_b64("work/whatsapp.mp4")
-}
-
-requests.post(apps_script_url, json=respuesta, timeout=120)
+if __name__ == "__main__":
+    main()
