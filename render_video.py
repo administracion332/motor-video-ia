@@ -1,12 +1,14 @@
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 import textwrap
 from pathlib import Path
 
 import requests
+from faster_whisper import WhisperModel
 from PIL import Image
 
 
@@ -14,49 +16,116 @@ def run_cmd(cmd):
     subprocess.run(cmd, check=True)
 
 
-def get_audio_duration(audio_path):
+def get_video_duration(video_path):
     cmd = [
-        "ffprobe",
-        "-v", "error",
+        "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
-        str(audio_path),
+        str(video_path),
     ]
     res = subprocess.check_output(cmd).decode("utf-8").strip()
-    return max(float(res), 5.0)
-
-
-def generate_tts(text, out_path):
-    for voice in ["es-AR-TomasNeural", "es-MX-JorgeNeural"]:
-        try:
-            run_cmd(["edge-tts", "--voice", voice, "--text", text, "--write-media", str(out_path)])
-            if out_path.exists() and out_path.stat().st_size > 1000:
-                return
-        except Exception as e:
-            print(f"Fallo voz {voice}: {e}")
-    raise RuntimeError("No se pudo generar el audio con edge-tts.")
+    return max(float(res), 3.0)
 
 
 def cargar_payload():
-    # 1. Lectura directa del evento oficial de GitHub Actions (repository_dispatch)
     event_path = os.environ.get("GITHUB_EVENT_PATH")
     if event_path and os.path.exists(event_path):
         try:
             with open(event_path, "r", encoding="utf-8") as f:
                 event_data = json.load(f)
             if isinstance(event_data.get("client_payload"), dict) and event_data["client_payload"]:
-                print("Payload cargado correctamente desde GITHUB_EVENT_PATH")
                 return event_data["client_payload"]
         except Exception as e:
             print(f"Error leyendo GITHUB_EVENT_PATH: {e}")
 
-    # 2. Respaldo por variables de entorno o argumento
     raw_payload = (
         os.environ.get("PAYLOAD")
         or os.environ.get("CLIENT_PAYLOAD")
         or (sys.argv[1] if len(sys.argv) > 1 else "{}")
     )
     return json.loads(raw_payload)
+
+
+def descargar_archivo_drive(file_id, destino):
+    session = requests.Session()
+    url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    resp = session.get(url, stream=True, timeout=60)
+
+    # Si Google Drive pide confirmación por tamaño de archivo
+    if "text/html" in resp.headers.get("Content-Type", ""):
+        html = resp.text
+        match = re.search(r'confirm=([0-9A-Za-z_-]+)', html)
+        if match:
+            url = f"https://drive.google.com/uc?export=download&confirm={match.group(1)}&id={file_id}"
+            resp = session.get(url, stream=True, timeout=60)
+        else:
+            url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
+            resp = session.get(url, stream=True, timeout=60)
+
+    resp.raise_for_status()
+    with open(destino, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=32768):
+            if chunk:
+                f.write(chunk)
+    print(f"Clip descargado desde Drive: {destino.stat().st_size / (1024*1024):.2f} MB")
+
+
+def format_ass_time(seconds):
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    cs = int(round((seconds - int(seconds)) * 100))
+    if cs >= 100:
+        cs = 99
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def generar_subtitulos_ia(video_path, ass_path):
+    print("Transcribiendo audio con Whisper AI para generar subtítulos...")
+    model = WhisperModel("base", device="cpu", compute_type="int8")
+    segments, _ = model.transcribe(str(video_path), language="es", word_timestamps=True)
+
+    header = """[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: TikTok,DejaVu Sans,58,&H00FFFFFF,&H0000FFFF,&H00111827,&HC8111827,-1,0,0,0,100,100,0,0,3,14,0,2,70,70,360,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    lines = [header]
+
+    for seg in segments:
+        words = getattr(seg, "words", None) or []
+        if words:
+            # Agrupa de a 4 palabras para lectura rápida estilo Reels/TikTok
+            chunk = []
+            for w in words:
+                chunk.append(w)
+                if len(chunk) == 4:
+                    start_t = format_ass_time(chunk[0].start)
+                    end_t = format_ass_time(chunk[-1].end)
+                    txt = " ".join([x.word.strip() for x in chunk]).upper()
+                    lines.append(f"Dialogue: 0,{start_t},{end_t},TikTok,,0,0,0,,{txt}\n")
+                    chunk = []
+            if chunk:
+                start_t = format_ass_time(chunk[0].start)
+                end_t = format_ass_time(chunk[-1].end)
+                txt = " ".join([x.word.strip() for x in chunk]).upper()
+                lines.append(f"Dialogue: 0,{start_t},{end_t},TikTok,,0,0,0,,{txt}\n")
+        else:
+            start_t = format_ass_time(seg.start)
+            end_t = format_ass_time(seg.end)
+            txt = seg.text.strip().upper()
+            if txt:
+                lines.append(f"Dialogue: 0,{start_t},{end_t},TikTok,,0,0,0,,{txt}\n")
+
+    ass_path.write_text("".join(lines), encoding="utf-8")
+    print(f"Subtítulos generados ({len(lines) - 1} bloques).")
 
 
 def main():
@@ -67,128 +136,106 @@ def main():
     producto = str(payload.get("producto") or "Oferta Destacada").strip()
     precio = str(payload.get("precio") or "").strip()
     gancho = str(payload.get("gancho") or producto).strip()
-    guion = str(payload.get("guion") or "").strip() or f"Conocé {producto}. {gancho}"
-    imagenes_urls = payload.get("imagenes") or []
-    clips_b64 = payload.get("clips_b64") or []
+    clip_file_ids = payload.get("clip_file_ids") or []
 
-    print(f"Procesando ID: {row_id} | Producto: {producto} | Imágenes recibidas: {len(imagenes_urls)}")
+    if not clip_file_ids:
+        raise RuntimeError("No se recibió ningún video propio en Clip_1. Sube tu clip antes de aprobar.")
 
     work = Path("/tmp/render_work")
     work.mkdir(parents=True, exist_ok=True)
 
-    # 1. Generar locución real y medir duración exacta
-    voz_path = work / "voz.mp3"
-    generate_tts(guion, voz_path)
-    duracion_total = round(get_audio_duration(voz_path) + 0.6, 2)
-    print(f"Duración objetivo del video: {duracion_total}s")
+    # 1. Descargar clip(s) grabado(s) por el usuario desde Google Drive
+    raw_clips = []
+    for idx, fid in enumerate(clip_file_ids):
+        dest = work / f"raw_clip_{idx}.mp4"
+        descargar_archivo_drive(fid, dest)
+        raw_clips.append(dest)
 
-    # 2. Preparar recursos visuales (clips propios o fotos de Tiendanube)
-    visuales = []
+    # Si subió 2 clips, los une primero
+    if len(raw_clips) > 1:
+        norm_clips = []
+        for idx, rc in enumerate(raw_clips):
+            nc = work / f"norm_{idx}.mp4"
+            run_cmd([
+                "ffmpeg", "-y", "-i", str(rc),
+                "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p",
+                "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-ar", "44100", "-ac", "2", str(nc)
+            ])
+            norm_clips.append(nc)
+        concat_txt = work / "clips.txt"
+        concat_txt.write_text("\n".join([f"file '{p}'" for p in norm_clips]), encoding="utf-8")
+        clip_unido = work / "clip_unido.mp4"
+        run_cmd(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_txt), "-c", "copy", str(clip_unido)])
+    else:
+        clip_unido = raw_clips[0]
 
-    for idx, b64 in enumerate(clips_b64):
-        try:
-            clip_path = work / f"clip_{idx}.mp4"
-            clip_path.write_bytes(base64.b64decode(b64))
-            visuales.append(("video", clip_path))
-        except Exception as e:
-            print(f"Error decodificando clip {idx}: {e}")
+    # 2. IA Paso 1: Recorte automático de silencios muertos (ritmo dinámico)
+    clip_sin_silencios = work / "clip_cortado.mp4"
+    try:
+        print("Eliminando silencios automáticamente con auto-editor...")
+        run_cmd(["auto-editor", str(clip_unido), "--margin", "0.15sec", "-o", str(clip_sin_silencios)])
+    except Exception as e:
+        print(f"Aviso auto-editor (se usa clip completo): {e}")
+        clip_sin_silencios = clip_unido
 
-    if not visuales:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        for idx, raw_url in enumerate(imagenes_urls[:4]):
-            url = str(raw_url).strip()
-            if url.startswith("//"):
-                url = "https:" + url
-            if not url.startswith("http"):
-                continue
-            try:
-                r = requests.get(url, headers=headers, timeout=15)
-                if r.status_code == 200 and len(r.content) > 1000:
-                    raw_img = work / f"raw_{idx}"
-                    raw_img.write_bytes(r.content)
-                    clean_jpg = work / f"img_{idx}.jpg"
-                    with Image.open(raw_img) as im:
-                        im.convert("RGB").save(clean_jpg, "JPEG", quality=92)
-                    visuales.append(("image", clean_jpg))
-                    print(f"Imagen {idx + 1} descargada OK")
-            except Exception as e:
-                print(f"Error descargando imagen {url}: {e}")
+    duracion = get_video_duration(clip_sin_silencios)
+    inicio_cierre = max(duracion - 4.0, 3.6)
 
-    if not visuales:
-        print("Aviso: usando imagen de respaldo por falta de imágenes descargables.")
-        fallback_jpg = work / "fallback.jpg"
-        Image.new("RGB", (1080, 1920), (20, 26, 38)).save(fallback_jpg, "JPEG")
-        visuales.append(("image", fallback_jpg))
+    # 3. IA Paso 2: Subtítulos automáticos estilo TikTok/Reels
+    ass_path = work / "subtitulos.ass"
+    tiene_subs = False
+    try:
+        generar_subtitulos_ia(clip_sin_silencios, ass_path)
+        tiene_subs = True
+    except Exception as e:
+        print(f"Aviso subtítulos IA: {e}")
 
-    # 3. Crear segmentos normalizados (fondo difuminado + producto centrado)
-    seg_dur = round(duracion_total / len(visuales), 3)
-    seg_files = []
-    vf_base = (
-        "split=2[bg][fg];"
-        "[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=25:5[b];"
-        "[fg]scale=1020:1350:force_original_aspect_ratio=decrease[f];"
-        "[b][f]overlay=(W-w)/2:(H-h)/2,fps=30,format=yuv420p"
-    )
-
-    for idx, (tipo, path) in enumerate(visuales):
-        seg_out = work / f"seg_{idx}.mp4"
-        if tipo == "video":
-            cmd = [
-                "ffmpeg", "-y", "-stream_loop", "-1", "-i", str(path),
-                "-t", str(seg_dur), "-filter_complex", vf_base,
-                "-c:v", "libx264", "-preset", "ultrafast", "-an", str(seg_out)
-            ]
-        else:
-            cmd = [
-                "ffmpeg", "-y", "-loop", "1", "-i", str(path),
-                "-t", str(seg_dur), "-filter_complex", vf_base,
-                "-c:v", "libx264", "-preset", "ultrafast", "-an", str(seg_out)
-            ]
-        run_cmd(cmd)
-        seg_files.append(seg_out)
-
-    concat_list = work / "concat.txt"
-    concat_list.write_text("\n".join([f"file '{p}'" for p in seg_files]), encoding="utf-8")
-
-    base_916 = work / "base_916.mp4"
-    run_cmd([
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
-        "-t", str(duracion_total), "-c", "copy", str(base_916)
-    ])
-
-    # 4. Exportar Formato 1: Instagram Reels / TikTok (1080x1920) con textos + voz
+    # 4. Formato 1: Instagram Reels / TikTok (1080x1920) con audio mejorado + subtítulos + carteles
     gancho_txt = work / "gancho.txt"
     pie_txt = work / "pie.txt"
-    gancho_txt.write_text(textwrap.fill(gancho[:70] or "Oferta Imperdible", width=26), encoding="utf-8")
-    pie_label = f"{producto[:42]}\n{precio}".strip() or "Consultá ahora"
-    pie_txt.write_text(textwrap.fill(pie_label, width=30), encoding="utf-8")
+    gancho_txt.write_text(textwrap.fill(gancho[:65], width=26), encoding="utf-8")
+    pie_txt.write_text(textwrap.fill(f"{producto[:40]}\n{precio}".strip(), width=30), encoding="utf-8")
 
     font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
     out_ig = work / "out_ig.mp4"
 
+    base_vf = (
+        "split=2[bg][fg];"
+        "[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=25:5[b];"
+        "[fg]scale=1080:1920:force_original_aspect_ratio=decrease[f];"
+        "[b][f]overlay=(W-w)/2:(H-h)/2,fps=30,format=yuv420p"
+    )
+    if tiene_subs:
+        base_vf += f",ass={ass_path}"
+
+    overlays = (
+        f",drawtext=fontfile={font_path}:textfile={gancho_txt}:fontcolor=black:fontsize=42:"
+        f"box=1:boxcolor=#FACC15@0.95:boxborderw=18:x=(w-text_w)/2:y=130:enable='between(t,0,3.5)',"
+        f"drawtext=fontfile={font_path}:textfile={pie_txt}:fontcolor=white:fontsize=40:"
+        f"box=1:boxcolor=#0F172A@0.90:boxborderw=20:x=(w-text_w)/2:y=h-text_h-160:enable='gte(t,{inicio_cierre:.2f})'"
+    )
+
+    audio_fx = "highpass=f=80,loudnorm=I=-16:TP=-1.5:LRA=11"
+
     try:
-        draw_filters = (
-            f"drawtext=fontfile={font_path}:textfile={gancho_txt}:fontcolor=black:fontsize=44:"
-            f"box=1:boxcolor=#FACC15@0.95:boxborderw=20:x=(w-text_w)/2:y=140,"
-            f"drawtext=fontfile={font_path}:textfile={pie_txt}:fontcolor=white:fontsize=40:"
-            f"box=1:boxcolor=#0F172A@0.88:boxborderw=20:x=(w-text_w)/2:y=h-text_h-170"
-        )
         run_cmd([
-            "ffmpeg", "-y", "-i", str(base_916), "-i", str(voz_path),
-            "-t", str(duracion_total), "-vf", draw_filters,
+            "ffmpeg", "-y", "-i", str(clip_sin_silencios),
+            "-filter_complex", base_vf + overlays,
+            "-af", audio_fx,
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k", "-shortest", str(out_ig)
+            "-c:a", "aac", "-b:a", "128k", str(out_ig)
         ])
     except Exception as e:
-        print(f"Renderizando sin drawtext por respaldo: {e}")
+        print(f"Reintentando sin drawtext por respaldo: {e}")
         run_cmd([
-            "ffmpeg", "-y", "-i", str(base_916), "-i", str(voz_path),
-            "-t", str(duracion_total),
+            "ffmpeg", "-y", "-i", str(clip_sin_silencios),
+            "-filter_complex", base_vf,
+            "-af", audio_fx,
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k", "-shortest", str(out_ig)
+            "-c:a", "aac", "-b:a", "128k", str(out_ig)
         ])
 
-    # 5. Exportar Formato 2: YouTube Horizontal (1920x1080)
+    # 5. Formato 2: YouTube Horizontal (1920x1080)
     out_yt = work / "out_yt.mp4"
     yt_filter = (
         "[0:v]split=2[bg][fg];"
@@ -198,21 +245,21 @@ def main():
     )
     run_cmd([
         "ffmpeg", "-y", "-i", str(out_ig),
-        "-t", str(duracion_total), "-filter_complex", yt_filter,
+        "-filter_complex", yt_filter,
         "-c:v", "libx264", "-preset", "fast", "-crf", "23",
         "-c:a", "copy", str(out_yt)
     ])
 
-    # 6. Exportar Formato 3: WhatsApp Estados ligero (720x1280)
+    # 6. Formato 3: WhatsApp Estados / Chats ligero (720x1280)
     out_wa = work / "out_wa.mp4"
     run_cmd([
         "ffmpeg", "-y", "-i", str(out_ig),
-        "-t", str(duracion_total), "-vf", "scale=720:1280",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "28",
+        "-vf", "scale=720:1280",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "27",
         "-c:a", "aac", "-b:a", "96k", str(out_wa)
     ])
 
-    # 7. Enviar los 3 MP4 de vuelta a Apps Script -> Google Drive
+    # 7. Devolver los 3 MP4 editados a Apps Script -> Google Drive
     if not apps_script_url:
         raise RuntimeError("Falta configurar el secreto APPS_SCRIPT_URL en GitHub.")
 
