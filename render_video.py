@@ -33,6 +33,21 @@ def descargar_drive(file_id, destino):
         with open(destino, "wb") as f:
             f.write(html_o_bin)
 
+def listar_modelos_disponibles():
+    if not GEMINI_API_KEY:
+        return []
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
+        with urllib.request.urlopen(url, timeout=20) as res:
+            data = json.loads(res.read().decode("utf-8"))
+            modelos = [m.get("name", "").replace("models/", "") for m in data.get("models", [])]
+            veo_models = [m for m in modelos if "veo" in m.lower()]
+            print("Modelos Veo detectados en tu clave:", veo_models if veo_models else "Ninguno (solo modelos Gemini)")
+            return modelos
+    except Exception as e:
+        print("Error listando modelos:", e)
+        return []
+
 def interpretar_prompt_edicion(prompt_edicion, producto):
     plan = {"generar_broll_ia": False, "posicion_broll": 1, "prompt_veo": ""}
     if not prompt_edicion or not str(prompt_edicion).strip():
@@ -47,42 +62,34 @@ def interpretar_prompt_edicion(prompt_edicion, producto):
     if any(k in p_low for k in palabras_clave):
         plan["generar_broll_ia"] = True
 
+    plan["prompt_veo"] = (
+        f"Vertical 9:16 photorealistic commercial close-up video showing a modern {producto} "
+        f"actively cooking and chopping fresh vegetables in a bright modern kitchen, "
+        f"smooth cinematic camera movement, natural lighting, no text or watermarks"
+    )
+
     if not GEMINI_API_KEY:
-        plan["prompt_veo"] = (
-            f"Vertical 9:16 commercial close-up video showing a modern stainless steel and black "
-            f"{producto} actively cooking and mixing fresh ingredients inside a bright modern kitchen, "
-            f"steam rising, natural sunlight, smooth cinematic camera movement, 4k photorealistic, no text"
-        )
         return plan
 
     try:
-        sys_prompt = f"""Analiza esta instruccion de edicion de video: "{prompt_edicion}" para el producto "{producto}".
-Si el usuario pide agregar una escena creada con IA o mostrar el producto en funcionamiento/uso, pon "generar_broll_ia": true.
-Devuelve SOLO un JSON valido:
-{{
-  "generar_broll_ia": true,
-  "posicion_broll": 1,
-  "prompt_veo": "Detailed 5-second vertical 9:16 photorealistic commercial video in English showing {producto} actively operating and working in a bright modern home environment, smooth cinematic close-up camera movement, natural lighting, no text or watermarks"
-}}"""
+        sys_prompt = (
+            f'Analiza esta instruccion de edicion de video: "{prompt_edicion}" para el producto "{producto}". '
+            f'Devuelve SOLO un JSON valido: '
+            f'{{"generar_broll_ia": true, "posicion_broll": 1, '
+            f'"prompt_veo": "Detailed 5-second vertical 9:16 photorealistic commercial video in English showing {producto} actively operating in a bright modern kitchen, smooth cinematic camera motion, natural lighting, no text"}}'
+        )
         body = json.dumps({
             "contents": [{"parts": [{"text": sys_prompt}]}],
             "generationConfig": {"responseMimeType": "application/json"}
         }).encode("utf-8")
-        req = urllib.request.Request(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
-            data=body,
-            headers={"Content-Type": "application/json"}
-        )
+        url_api = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+        req = urllib.request.Request(url_api, data=body, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=30) as res:
             data = json.loads(res.read().decode("utf-8"))
             parsed = json.loads(data["candidates"][0]["content"]["parts"][0]["text"])
             plan.update(parsed)
     except Exception as e:
         print("Aviso Gemini Flash plan:", e)
-        plan["prompt_veo"] = (
-            f"Vertical 9:16 photorealistic commercial video showing {producto} actively operating in a bright modern kitchen, "
-            f"smooth cinematic camera motion, natural lighting, no text"
-        )
 
     return plan
 
@@ -97,11 +104,10 @@ def intentar_modelo_veo(modelo, prompt_veo, salida_mp4):
         op = json.loads(res.read().decode("utf-8"))
     op_name = op.get("name")
     if not op_name:
-        print(f"Modelo {modelo} no devolvió operación:", op)
         return False
 
     print(f"Operación Veo iniciada ({modelo}): {op_name}")
-    for intento in range(22):
+    for _ in range(22):
         time.sleep(8)
         poll_url = f"https://generativelanguage.googleapis.com/v1beta/{op_name}?key={GEMINI_API_KEY}"
         with urllib.request.urlopen(poll_url, timeout=30) as p_res:
@@ -116,25 +122,25 @@ def intentar_modelo_veo(modelo, prompt_veo, salida_mp4):
                 or resp_obj.get("generatedVideos", [])
             )
             if samples:
-                vid_info = samples[0].get("video", {})
-                vid_uri = vid_info.get("uri", "")
+                vid_uri = samples[0].get("video", {}).get("uri", "")
                 if vid_uri:
                     sep = "&" if "?" in vid_uri else "?"
                     dl_url = f"{vid_uri}{sep}key={GEMINI_API_KEY}"
                     urllib.request.urlretrieve(dl_url, salida_mp4)
                     print(f"Escena IA descargada OK desde {modelo} ({os.path.getsize(salida_mp4)} bytes).")
                     return os.path.exists(salida_mp4) and os.path.getsize(salida_mp4) > 50000
-            print(f"Respuesta sin video en {modelo}:", json.dumps(resp_obj)[:500])
             return False
-    print(f"Tiempo de espera agotado para {modelo}.")
     return False
 
-def generar_clip_veo(prompt_veo, salida_mp4):
+def generar_clip_veo(prompt_veo, salida_mp4, modelos_disponibles):
     if not GEMINI_API_KEY or not prompt_veo:
-        print("Falta GEMINI_API_KEY o prompt_veo vacío.")
         return False
 
-    for modelo in ["veo-3.0-generate-001", "veo-2.0-generate-001"]:
+    candidatos = [m for m in modelos_disponibles if "veo" in m.lower()]
+    if not candidatos:
+        candidatos = ["veo-3.0-generate-001", "veo-2.0-generate-001"]
+
+    for modelo in candidatos:
         try:
             print(f"Probando generación IA con {modelo}: {prompt_veo}")
             if intentar_modelo_veo(modelo, prompt_veo, salida_mp4):
@@ -157,14 +163,15 @@ def transcribir_audio_a_srt(video_mp4, ruta_srt, producto=""):
     with open(audio_mp3, "rb") as f:
         audio_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-    prompt_srt = f"""Escuchá con precisión el audio de este video comercial en español argentino (sobre {producto}).
-Transcribí EXACTAMENTE las palabras que dicen las personas en el video, sincronizadas segundo a segundo, en formato de subtítulos SRT estándar.
-
-REGLAS OBLIGATORIAS:
-1. Escribí ÚNICAMENTE lo que se escucha en el audio (no inventes texto ni agregues comentarios; si hay tramos instrumentales sin voz, no pongas subtítulos en esos segundos).
-2. Cada bloque debe ser corto (entre 3 y 6 palabras máximo, máximo 26 caracteres por línea) para que entre cómodo en pantalla vertical sin cortarse.
-3. Respetá exactamente los tiempos de inicio y fin de cada frase hablada (formato HH:MM:SS,mmm --> HH:MM:SS,mmm).
-4. Devolvé SOLO el contenido del archivo SRT válido, sin bloques markdown ``` ni texto extra."""
+    prompt_srt = (
+        f"Escuchá con precisión el audio de este video comercial en español argentino (sobre {producto}).\n"
+        f"Transcribí EXACTAMENTE las palabras que dicen las personas en el video, sincronizadas segundo a segundo, en formato de subtítulos SRT estándar.\n\n"
+        f"REGLAS OBLIGATORIAS:\n"
+        f"1. Escribí ÚNICAMENTE lo que se escucha en el audio (no inventes texto ni agregues comentarios; si hay silencios, no pongas subtítulos en esos segundos).\n"
+        f"2. Cada bloque debe ser corto (entre 3 y 6 palabras máximo, máximo 25 caracteres por línea) para que entre cómodo en pantalla vertical sin cortarse.\n"
+        f"3. Respetá exactamente los tiempos de inicio y fin de cada frase hablada (formato HH:MM:SS,mmm --> HH:MM:SS,mmm).\n"
+        f"4. Devolvé SOLO el contenido del archivo SRT válido, sin bloques markdown ``` ni texto extra."
+    )
 
     body = json.dumps({
         "contents": [{
@@ -176,12 +183,10 @@ REGLAS OBLIGATORIAS:
         "generationConfig": {"temperature": 0.1}
     }).encode("utf-8")
 
+    url_api = f"[https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=){GEMINI_API_KEY}"
+
     try:
-        req = urllib.request.Request(
-            f"[https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=){GEMINI_API_KEY}",
-            data=body,
-            headers={"Content-Type": "application/json"}
-        )
+        req = urllib.request.Request(url_api, data=body, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=60) as res:
             data = json.loads(res.read().decode("utf-8"))
             srt_txt = data["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -190,8 +195,10 @@ REGLAS OBLIGATORIAS:
             if "-->" in srt_txt:
                 with open(ruta_srt, "w", encoding="utf-8") as f:
                     f.write(srt_txt + "\n")
-                print("Transcripción SRT generada OK:\n", srt_txt[:400])
+                print("Transcripción SRT generada OK:\n", srt_txt[:500])
                 return True
+    except urllib.error.HTTPError as he:
+        print("Error HTTP transcribiendo audio:", he.code, he.read().decode("utf-8", errors="ignore"))
     except Exception as e:
         print("Error transcribiendo audio:", e)
     return False
@@ -222,7 +229,8 @@ def main():
     prompt_edicion = payload.get("prompt_edicion", "")
     clip_ids = payload.get("clip_file_ids", [])
 
-    print(f"Iniciando render ID={row_id} | Producto={producto} | Prompt_Edicion='{prompt_edicion}' | Clips={len(clip_ids)}")
+    print(f"Iniciando render ID={row_id} | Producto={producto} | Clips={len(clip_ids)}")
+    modelos_disponibles = listar_modelos_disponibles()
 
     os.makedirs("work", exist_ok=True)
     clips_norm = []
@@ -238,12 +246,10 @@ def main():
             print(f"Error en clip {idx}: {e}")
 
     plan = interpretar_prompt_edicion(prompt_edicion, producto)
-    print("Plan de edición IA:", plan)
-
     if plan.get("generar_broll_ia"):
         veo_raw = "work/veo_raw.mp4"
         veo_norm = "work/veo_norm.mp4"
-        if generar_clip_veo(plan.get("prompt_veo", ""), veo_raw):
+        if generar_clip_veo(plan.get("prompt_veo", ""), veo_raw, modelos_disponibles):
             subprocess.run([
                 "ffmpeg", "-y", "-i", veo_raw, "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
                 "-shortest", "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30,format=yuv420p",
@@ -252,8 +258,6 @@ def main():
             pos = min(max(1, int(plan.get("posicion_broll", 1))), len(clips_norm))
             clips_norm.insert(pos, veo_norm)
             print(f"Escena IA insertada en posición {pos}.")
-        else:
-            print("ATENCIÓN: No se pudo generar el clip con Veo (revisar mensaje HTTP Error arriba).")
 
     if not clips_norm:
         raise RuntimeError("No se encontraron clips validos.")
