@@ -19,25 +19,6 @@ def limpiar_texto(txt):
     txt = re.sub(r'[^\w\sáéíóúÁÉÍÓÚñÑüÜ.,:;!?¡¿$%()/-]', '', txt)
     return re.sub(r'\s+', ' ', txt).strip()
 
-def escapar_drawtext(txt):
-    txt = limpiar_texto(txt)
-    txt = txt.replace("\\", "\\\\").replace(":", "\\:").replace("'", "").replace('"', '')
-    return txt
-
-def dividir_lineas(txt, max_chars=24):
-    palabras = limpiar_texto(txt).split()
-    lineas, actual = [], ""
-    for p in palabras:
-        if len(actual) + len(p) + 1 <= max_chars:
-            actual = (actual + " " + p).strip()
-        else:
-            if actual:
-                lineas.append(actual)
-            actual = p
-    if actual:
-        lineas.append(actual)
-    return "\n".join(lineas[:3])
-
 def descargar_drive(file_id, destino):
     url = f"https://drive.google.com/uc?export=download&id={file_id}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -54,24 +35,34 @@ def descargar_drive(file_id, destino):
 
 def interpretar_prompt_edicion(prompt_edicion, producto):
     plan = {"generar_broll_ia": False, "posicion_broll": 1, "prompt_veo": ""}
-    if not prompt_edicion:
+    if not prompt_edicion or not str(prompt_edicion).strip():
         return plan
 
-    p_low = prompt_edicion.lower()
-    if any(k in p_low for k in ["ia", "inteligencia artificial", "veo", "escena", "cocina", "demostrando", "creado"]):
+    p_low = str(prompt_edicion).lower()
+    palabras_clave = [
+        "ia", "inteligencia artificial", "veo", "escena", "funcionando",
+        "funcionamiento", "cocinando", "trabajando", "uso", "usando",
+        "demostrando", "creado", "genera", "mostrando", "b-roll", "broll"
+    ]
+    if any(k in p_low for k in palabras_clave):
         plan["generar_broll_ia"] = True
 
     if not GEMINI_API_KEY:
-        plan["prompt_veo"] = f"Vertical 9:16 realistic commercial video showing {producto} in use in a bright modern kitchen, cinematic lighting, no text"
+        plan["prompt_veo"] = (
+            f"Vertical 9:16 commercial close-up video showing a modern stainless steel and black "
+            f"{producto} actively cooking and mixing fresh ingredients inside a bright modern kitchen, "
+            f"steam rising, natural sunlight, smooth cinematic camera movement, 4k photorealistic, no text"
+        )
         return plan
 
     try:
-        sys_prompt = f"""Analiza esta instruccion de edicion: "{prompt_edicion}" para el producto "{producto}".
+        sys_prompt = f"""Analiza esta instruccion de edicion de video: "{prompt_edicion}" para el producto "{producto}".
+Si el usuario pide agregar una escena creada con IA o mostrar el producto en funcionamiento/uso, pon "generar_broll_ia": true.
 Devuelve SOLO un JSON valido:
 {{
-  "generar_broll_ia": true o false,
+  "generar_broll_ia": true,
   "posicion_broll": 1,
-  "prompt_veo": "Detailed 5-second vertical 9:16 realistic commercial shot in English showing {producto} in everyday use in a modern home, natural lighting, smooth camera movement, no text or watermarks"
+  "prompt_veo": "Detailed 5-second vertical 9:16 photorealistic commercial video in English showing {producto} actively operating and working in a bright modern home environment, smooth cinematic close-up camera movement, natural lighting, no text or watermarks"
 }}"""
         body = json.dumps({
             "contents": [{"parts": [{"text": sys_prompt}]}],
@@ -87,47 +78,122 @@ Devuelve SOLO un JSON valido:
             parsed = json.loads(data["candidates"][0]["content"]["parts"][0]["text"])
             plan.update(parsed)
     except Exception as e:
-        print("Aviso Gemini Flash:", e)
-        plan["prompt_veo"] = f"Vertical 9:16 realistic commercial video showing {producto} working in a bright modern kitchen, cinematic lighting, no text"
+        print("Aviso Gemini Flash plan:", e)
+        plan["prompt_veo"] = (
+            f"Vertical 9:16 photorealistic commercial video showing {producto} actively operating in a bright modern kitchen, "
+            f"smooth cinematic camera motion, natural lighting, no text"
+        )
 
     return plan
 
-def generar_clip_veo(prompt_veo, salida_mp4):
-    if not GEMINI_API_KEY or not prompt_veo:
+def intentar_modelo_veo(modelo, prompt_veo, salida_mp4):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:predictLongRunning?key={GEMINI_API_KEY}"
+    payload = json.dumps({
+        "instances": [{"prompt": prompt_veo}],
+        "parameters": {"aspectRatio": "9:16"}
+    }).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as res:
+        op = json.loads(res.read().decode("utf-8"))
+    op_name = op.get("name")
+    if not op_name:
+        print(f"Modelo {modelo} no devolvió operación:", op)
         return False
-    try:
-        print("Solicitando escena IA a Google Veo:", prompt_veo)
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/veo-2.0-generate-001:predictLongRunning?key={GEMINI_API_KEY}"
-        payload = json.dumps({
-            "instances": [{"prompt": prompt_veo}],
-            "parameters": {"aspectRatio": "9:16", "durationSeconds": 5}
-        }).encode("utf-8")
-        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=30) as res:
-            op = json.loads(res.read().decode("utf-8"))
-        op_name = op.get("name")
-        if not op_name:
-            return False
 
-        for _ in range(18):
-            time.sleep(8)
-            poll_url = f"https://generativelanguage.googleapis.com/v1beta/{op_name}?key={GEMINI_API_KEY}"
-            with urllib.request.urlopen(poll_url, timeout=30) as p_res:
-                status = json.loads(p_res.read().decode("utf-8"))
-            if status.get("done"):
-                samples = status.get("response", {}).get("generateVideoResponse", {}).get("generatedSamples", [])
-                if samples:
-                    vid_uri = samples[0]["video"]["uri"]
+    print(f"Operación Veo iniciada ({modelo}): {op_name}")
+    for intento in range(22):
+        time.sleep(8)
+        poll_url = f"https://generativelanguage.googleapis.com/v1beta/{op_name}?key={GEMINI_API_KEY}"
+        with urllib.request.urlopen(poll_url, timeout=30) as p_res:
+            status = json.loads(p_res.read().decode("utf-8"))
+        if status.get("done"):
+            if status.get("error"):
+                print(f"Error interno en operación {modelo}:", status["error"])
+                return False
+            resp_obj = status.get("response", {})
+            samples = (
+                resp_obj.get("generateVideoResponse", {}).get("generatedSamples", [])
+                or resp_obj.get("generatedVideos", [])
+            )
+            if samples:
+                vid_info = samples[0].get("video", {})
+                vid_uri = vid_info.get("uri", "")
+                if vid_uri:
                     sep = "&" if "?" in vid_uri else "?"
                     dl_url = f"{vid_uri}{sep}key={GEMINI_API_KEY}"
                     urllib.request.urlretrieve(dl_url, salida_mp4)
-                    print("Escena IA descargada OK.")
+                    print(f"Escena IA descargada OK desde {modelo} ({os.path.getsize(salida_mp4)} bytes).")
                     return os.path.exists(salida_mp4) and os.path.getsize(salida_mp4) > 50000
-                break
-    except urllib.error.HTTPError as he:
-        print("HTTP Error Veo IA:", he.code, he.read().decode("utf-8", errors="ignore"))
+            print(f"Respuesta sin video en {modelo}:", json.dumps(resp_obj)[:500])
+            return False
+    print(f"Tiempo de espera agotado para {modelo}.")
+    return False
+
+def generar_clip_veo(prompt_veo, salida_mp4):
+    if not GEMINI_API_KEY or not prompt_veo:
+        print("Falta GEMINI_API_KEY o prompt_veo vacío.")
+        return False
+
+    for modelo in ["veo-3.0-generate-001", "veo-2.0-generate-001"]:
+        try:
+            print(f"Probando generación IA con {modelo}: {prompt_veo}")
+            if intentar_modelo_veo(modelo, prompt_veo, salida_mp4):
+                return True
+        except urllib.error.HTTPError as he:
+            detalle = he.read().decode("utf-8", errors="ignore")
+            print(f"HTTP Error en {modelo} ({he.code}): {detalle}")
+        except Exception as e:
+            print(f"Excepción en {modelo}: {e}")
+    return False
+
+def transcribir_audio_a_srt(video_mp4, ruta_srt, producto=""):
+    if not GEMINI_API_KEY:
+        return False
+    audio_mp3 = "work/audio_transcripcion.mp3"
+    subprocess.run([
+        "ffmpeg", "-y", "-i", video_mp4, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k", audio_mp3
+    ], check=True)
+
+    with open(audio_mp3, "rb") as f:
+        audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    prompt_srt = f"""Escuchá con precisión el audio de este video comercial en español argentino (sobre {producto}).
+Transcribí EXACTAMENTE las palabras que dicen las personas en el video, sincronizadas segundo a segundo, en formato de subtítulos SRT estándar.
+
+REGLAS OBLIGATORIAS:
+1. Escribí ÚNICAMENTE lo que se escucha en el audio (no inventes texto ni agregues comentarios; si hay tramos instrumentales sin voz, no pongas subtítulos en esos segundos).
+2. Cada bloque debe ser corto (entre 3 y 6 palabras máximo, máximo 26 caracteres por línea) para que entre cómodo en pantalla vertical sin cortarse.
+3. Respetá exactamente los tiempos de inicio y fin de cada frase hablada (formato HH:MM:SS,mmm --> HH:MM:SS,mmm).
+4. Devolvé SOLO el contenido del archivo SRT válido, sin bloques markdown ``` ni texto extra."""
+
+    body = json.dumps({
+        "contents": [{
+            "parts": [
+                {"text": prompt_srt},
+                {"inline_data": {"mime_type": "audio/mp3", "data": audio_b64}}
+            ]
+        }],
+        "generationConfig": {"temperature": 0.1}
+    }).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(
+            f"[https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=){GEMINI_API_KEY}",
+            data=body,
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=60) as res:
+            data = json.loads(res.read().decode("utf-8"))
+            srt_txt = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            srt_txt = re.sub(r'^```[a-zA-Z]*\n?', '', srt_txt)
+            srt_txt = re.sub(r'\n?```$', '', srt_txt).strip()
+            if "-->" in srt_txt:
+                with open(ruta_srt, "w", encoding="utf-8") as f:
+                    f.write(srt_txt + "\n")
+                print("Transcripción SRT generada OK:\n", srt_txt[:400])
+                return True
     except Exception as e:
-        print("Error Veo IA:", e)
+        print("Error transcribiendo audio:", e)
     return False
 
 def normalizar_clip(entrada, salida, w=1080, h=1920):
@@ -138,8 +204,8 @@ def normalizar_clip(entrada, salida, w=1080, h=1920):
     cmd = [
         "ffmpeg", "-y", "-i", entrada,
         "-vf", vf,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "22",
-        "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "19",
+        "-c:a", "aac", "-b:a", "160k", "-ar", "44100", "-ac", "2",
         salida
     ]
     subprocess.run(cmd, check=True)
@@ -153,11 +219,10 @@ def main():
     payload = event.get("client_payload", {})
     row_id = payload.get("id", "VIDEO")
     producto = limpiar_texto(payload.get("producto", "Casa Dion"))
-    precio = limpiar_texto(payload.get("precio", ""))
-    gancho = limpiar_texto(payload.get("gancho", ""))
-    guion = limpiar_texto(payload.get("guion", ""))
     prompt_edicion = payload.get("prompt_edicion", "")
     clip_ids = payload.get("clip_file_ids", [])
+
+    print(f"Iniciando render ID={row_id} | Producto={producto} | Prompt_Edicion='{prompt_edicion}' | Clips={len(clip_ids)}")
 
     os.makedirs("work", exist_ok=True)
     clips_norm = []
@@ -173,6 +238,8 @@ def main():
             print(f"Error en clip {idx}: {e}")
 
     plan = interpretar_prompt_edicion(prompt_edicion, producto)
+    print("Plan de edición IA:", plan)
+
     if plan.get("generar_broll_ia"):
         veo_raw = "work/veo_raw.mp4"
         veo_norm = "work/veo_norm.mp4"
@@ -180,10 +247,13 @@ def main():
             subprocess.run([
                 "ffmpeg", "-y", "-i", veo_raw, "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
                 "-shortest", "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30,format=yuv420p",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "22", "-c:a", "aac", "-b:a", "128k", veo_norm
+                "-c:v", "libx264", "-preset", "fast", "-crf", "19", "-c:a", "aac", "-b:a", "160k", veo_norm
             ], check=True)
             pos = min(max(1, int(plan.get("posicion_broll", 1))), len(clips_norm))
             clips_norm.insert(pos, veo_norm)
+            print(f"Escena IA insertada en posición {pos}.")
+        else:
+            print("ATENCIÓN: No se pudo generar el clip con Veo (revisar mensaje HTTP Error arriba).")
 
     if not clips_norm:
         raise RuntimeError("No se encontraron clips validos.")
@@ -199,75 +269,40 @@ def main():
         "-c", "copy", unido_mp4
     ], check=True)
 
-    dur_out = subprocess.check_output([
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", unido_mp4
-    ]).decode().strip()
-    duracion = float(dur_out or 15.0)
-    inicio_cierre = max(0.0, duracion - 4.0)
-
     font_bold = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
     if not os.path.exists(font_bold):
         font_bold = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
-    # Subtítulos dinámicos repartidos a lo largo del video a la altura del pecho (y=h*0.60)
-    # 1) Opacidad del video al 83% (capa negra al 17%: drawbox=color=black@0.17:t=fill) para resaltar letras sin fondo
-    # 2) Marca de agua sutil CASA DION arriba a la derecha
-    # 3) Subtítulos sin caja (box=0), blanco/amarillo alternados con contorno negro nítido en y=h*0.60
     filtros = [
         "drawbox=x=0:y=0:w=iw:h=ih:color=black@0.17:t=fill",
         f"drawtext=fontfile={font_bold}:text='CASA DION':fontcolor=white@0.28:fontsize=34:x=w-tw-45:y=55"
     ]
 
-    # Armar bloques de subtítulos (gancho + frases del guion + cierre con producto y precio)
-    frases = []
-    if gancho:
-        frases.append((gancho, "yellow"))
-    if guion:
-        partes = [p.strip() for p in re.split(r'[.!?]+', guion) if len(p.strip()) > 4]
-        for i, p in enumerate(partes[:4]):
-            color = "white" if i % 2 == 0 else "yellow"
-            frases.append((p, color))
-
-    tiempo_util = max(3.0, inicio_cierre - 0.3)
-    if frases:
-        dur_cada = tiempo_util / len(frases)
-        for idx, (texto_f, color_f) in enumerate(frases):
-            t_ini = 0.2 + idx * dur_cada
-            t_fin = t_ini + dur_cada - 0.08
-            txt_esc = escapar_drawtext(dividir_lineas(texto_f, 22))
-            if txt_esc:
-                filtros.append(
-                    f"drawtext=fontfile={font_bold}:text='{txt_esc}':fontcolor={color_f}:fontsize=56:"
-                    f"borderw=4:bordercolor=black:shadowcolor=black@0.75:shadowx=2:shadowy=3:"
-                    f"line_spacing=10:x=(w-text_w)/2:y=h*0.60:enable='between(t,{t_ini:.2f},{t_fin:.2f})'"
-                )
-
-    cierre_txt = escapar_drawtext(dividir_lineas(f"{producto} - {precio}" if precio else producto, 24))
-    if cierre_txt:
-        filtros.append(
-            f"drawtext=fontfile={font_bold}:text='{cierre_txt}':fontcolor=yellow:fontsize=52:"
-            f"borderw=4:bordercolor=black:shadowcolor=black@0.75:shadowx=2:shadowy=3:"
-            f"line_spacing=10:x=(w-text_w)/2:y=h*0.60:enable='gte(t,{inicio_cierre:.2f})'"
+    ruta_srt = "work/subtitulos.srt"
+    if transcribir_audio_a_srt(unido_mp4, ruta_srt, producto):
+        estilo_sub = (
+            "FontName=Liberation Sans,FontSize=14,Bold=1,"
+            "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H00000000,"
+            "BorderStyle=1,Outline=2,Shadow=1,Alignment=2,"
+            "MarginL=35,MarginR=35,MarginV=125"
         )
+        filtros.append(f"subtitles={ruta_srt}:force_style='{estilo_sub}'")
 
     vf_final = ",".join(filtros)
 
     ig_mp4 = "work/final_ig.mp4"
     wa_mp4 = "work/final_wa.mp4"
 
-    # Full HD 1080x1920 nítido (~8-12 MB para no saturar Apps Script)
     subprocess.run([
         "ffmpeg", "-y", "-i", unido_mp4, "-vf", vf_final,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "22", "-maxrate", "3200k", "-bufsize", "6400k",
-        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", ig_mp4
+        "-c:v", "libx264", "-preset", "fast", "-crf", "19", "-maxrate", "6500k", "-bufsize", "13000k",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", ig_mp4
     ], check=True)
 
-    # Versión liviana HD 720x1280 para WhatsApp
     subprocess.run([
         "ffmpeg", "-y", "-i", ig_mp4, "-vf", "scale=720:1280",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "25", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", wa_mp4
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", wa_mp4
     ], check=True)
 
     print(f"Pesos finales -> FullHD: {os.path.getsize(ig_mp4)/1024/1024:.1f} MB | WA: {os.path.getsize(wa_mp4)/1024/1024:.1f} MB")
@@ -276,12 +311,10 @@ def main():
         with open(path, "rb") as f:
             return base64.b64encode(f.read()).decode("utf-8")
 
-    # Enviamos ig_tiktok_b64 y whatsapp_b64 (Apps Script usará el mismo FullHD para YouTube sin duplicar peso)
-    ig_b64 = a_b64(ig_mp4)
     payload_vuelta = json.dumps({
         "accion": "guardar_videos",
         "id": row_id,
-        "ig_tiktok_b64": ig_b64,
+        "ig_tiktok_b64": a_b64(ig_mp4),
         "youtube_b64": "",
         "whatsapp_b64": a_b64(wa_mp4)
     }).encode("utf-8")
