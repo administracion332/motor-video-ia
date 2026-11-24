@@ -24,7 +24,7 @@ def escapar_drawtext(txt):
     txt = txt.replace("\\", "\\\\").replace(":", "\\:").replace("'", "").replace('"', '')
     return txt
 
-def dividir_lineas(txt, max_chars=25):
+def dividir_lineas(txt, max_chars=24):
     palabras = limpiar_texto(txt).split()
     lineas, actual = [], ""
     for p in palabras:
@@ -53,11 +53,7 @@ def descargar_drive(file_id, destino):
             f.write(html_o_bin)
 
 def interpretar_prompt_edicion(prompt_edicion, producto):
-    plan = {
-        "generar_broll_ia": False,
-        "posicion_broll": 1,
-        "prompt_veo": ""
-    }
+    plan = {"generar_broll_ia": False, "posicion_broll": 1, "prompt_veo": ""}
     if not prompt_edicion:
         return plan
 
@@ -66,16 +62,16 @@ def interpretar_prompt_edicion(prompt_edicion, producto):
         plan["generar_broll_ia"] = True
 
     if not GEMINI_API_KEY:
-        plan["prompt_veo"] = f"Vertical 9:16 realistic commercial shot showing {producto} in everyday use in a bright modern kitchen, cinematic lighting, no text"
+        plan["prompt_veo"] = f"Vertical 9:16 realistic commercial video showing {producto} in use in a bright modern kitchen, cinematic lighting, no text"
         return plan
 
     try:
-        sys_prompt = f"""Analiza esta instrucción de edición: "{prompt_edicion}" para el producto "{producto}".
-Devuelve SOLO un JSON válido:
+        sys_prompt = f"""Analiza esta instruccion de edicion: "{prompt_edicion}" para el producto "{producto}".
+Devuelve SOLO un JSON valido:
 {{
   "generar_broll_ia": true o false,
   "posicion_broll": 1,
-  "prompt_veo": "Detailed 5-second vertical 9:16 realistic commercial video in English showing {producto} in everyday use in a modern home, natural lighting, smooth camera movement, no text or watermarks"
+  "prompt_veo": "Detailed 5-second vertical 9:16 realistic commercial shot in English showing {producto} in everyday use in a modern home, natural lighting, smooth camera movement, no text or watermarks"
 }}"""
         body = json.dumps({
             "contents": [{"parts": [{"text": sys_prompt}]}],
@@ -113,7 +109,7 @@ def generar_clip_veo(prompt_veo, salida_mp4):
         if not op_name:
             return False
 
-        for _ in range(20):
+        for _ in range(18):
             time.sleep(8)
             poll_url = f"https://generativelanguage.googleapis.com/v1beta/{op_name}?key={GEMINI_API_KEY}"
             with urllib.request.urlopen(poll_url, timeout=30) as p_res:
@@ -125,7 +121,7 @@ def generar_clip_veo(prompt_veo, salida_mp4):
                     sep = "&" if "?" in vid_uri else "?"
                     dl_url = f"{vid_uri}{sep}key={GEMINI_API_KEY}"
                     urllib.request.urlretrieve(dl_url, salida_mp4)
-                    print("Escena IA generada correctamente.")
+                    print("Escena IA descargada OK.")
                     return os.path.exists(salida_mp4) and os.path.getsize(salida_mp4) > 50000
                 break
     except urllib.error.HTTPError as he:
@@ -142,7 +138,7 @@ def normalizar_clip(entrada, salida, w=1080, h=1920):
     cmd = [
         "ffmpeg", "-y", "-i", entrada,
         "-vf", vf,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "21",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "22",
         "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
         salida
     ]
@@ -159,6 +155,7 @@ def main():
     producto = limpiar_texto(payload.get("producto", "Casa Dion"))
     precio = limpiar_texto(payload.get("precio", ""))
     gancho = limpiar_texto(payload.get("gancho", ""))
+    guion = limpiar_texto(payload.get("guion", ""))
     prompt_edicion = payload.get("prompt_edicion", "")
     clip_ids = payload.get("clip_file_ids", [])
 
@@ -173,7 +170,7 @@ def main():
             normalizar_clip(raw_p, norm_p)
             clips_norm.append(norm_p)
         except Exception as e:
-            print(f"Error descargando/normalizando clip {idx}: {e}")
+            print(f"Error en clip {idx}: {e}")
 
     plan = interpretar_prompt_edicion(prompt_edicion, producto)
     if plan.get("generar_broll_ia"):
@@ -183,13 +180,13 @@ def main():
             subprocess.run([
                 "ffmpeg", "-y", "-i", veo_raw, "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
                 "-shortest", "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30,format=yuv420p",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "21", "-c:a", "aac", "-b:a", "128k", veo_norm
+                "-c:v", "libx264", "-preset", "fast", "-crf", "22", "-c:a", "aac", "-b:a", "128k", veo_norm
             ], check=True)
             pos = min(max(1, int(plan.get("posicion_broll", 1))), len(clips_norm))
             clips_norm.insert(pos, veo_norm)
 
     if not clips_norm:
-        raise RuntimeError("No se pudieron procesar clips de entrada.")
+        raise RuntimeError("No se encontraron clips validos.")
 
     concat_txt = "work/lista.txt"
     with open(concat_txt, "w", encoding="utf-8") as f:
@@ -213,53 +210,79 @@ def main():
     if not os.path.exists(font_bold):
         font_bold = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
-    gancho_txt = escapar_drawtext(dividir_lineas(gancho, 24))
-    cierre_txt = escapar_drawtext(dividir_lineas(f"{producto} - {precio}" if precio else producto, 25))
-
+    # Subtítulos dinámicos repartidos a lo largo del video a la altura del pecho (y=h*0.60)
+    # 1) Opacidad del video al 83% (capa negra al 17%: drawbox=color=black@0.17:t=fill) para resaltar letras sin fondo
+    # 2) Marca de agua sutil CASA DION arriba a la derecha
+    # 3) Subtítulos sin caja (box=0), blanco/amarillo alternados con contorno negro nítido en y=h*0.60
     filtros = [
+        "drawbox=x=0:y=0:w=iw:h=ih:color=black@0.17:t=fill",
         f"drawtext=fontfile={font_bold}:text='CASA DION':fontcolor=white@0.28:fontsize=34:x=w-tw-45:y=55"
     ]
-    if gancho_txt:
-        filtros.append(
-            f"drawtext=fontfile={font_bold}:text='{gancho_txt}':fontcolor=yellow:fontsize=54:borderw=4:bordercolor=black:line_spacing=10:x=(w-text_w)/2:y=240:enable='between(t,0.2,3.8)'"
-        )
+
+    # Armar bloques de subtítulos (gancho + frases del guion + cierre con producto y precio)
+    frases = []
+    if gancho:
+        frases.append((gancho, "yellow"))
+    if guion:
+        partes = [p.strip() for p in re.split(r'[.!?]+', guion) if len(p.strip()) > 4]
+        for i, p in enumerate(partes[:4]):
+            color = "white" if i % 2 == 0 else "yellow"
+            frases.append((p, color))
+
+    tiempo_util = max(3.0, inicio_cierre - 0.3)
+    if frases:
+        dur_cada = tiempo_util / len(frases)
+        for idx, (texto_f, color_f) in enumerate(frases):
+            t_ini = 0.2 + idx * dur_cada
+            t_fin = t_ini + dur_cada - 0.08
+            txt_esc = escapar_drawtext(dividir_lineas(texto_f, 22))
+            if txt_esc:
+                filtros.append(
+                    f"drawtext=fontfile={font_bold}:text='{txt_esc}':fontcolor={color_f}:fontsize=56:"
+                    f"borderw=4:bordercolor=black:shadowcolor=black@0.75:shadowx=2:shadowy=3:"
+                    f"line_spacing=10:x=(w-text_w)/2:y=h*0.60:enable='between(t,{t_ini:.2f},{t_fin:.2f})'"
+                )
+
+    cierre_txt = escapar_drawtext(dividir_lineas(f"{producto} - {precio}" if precio else producto, 24))
     if cierre_txt:
         filtros.append(
-            f"drawtext=fontfile={font_bold}:text='{cierre_txt}':fontcolor=white:fontsize=48:borderw=4:bordercolor=black:line_spacing=10:x=(w-text_w)/2:y=h-360:enable='gte(t,{inicio_cierre:.2f})'"
+            f"drawtext=fontfile={font_bold}:text='{cierre_txt}':fontcolor=yellow:fontsize=52:"
+            f"borderw=4:bordercolor=black:shadowcolor=black@0.75:shadowx=2:shadowy=3:"
+            f"line_spacing=10:x=(w-text_w)/2:y=h*0.60:enable='gte(t,{inicio_cierre:.2f})'"
         )
 
     vf_final = ",".join(filtros)
 
     ig_mp4 = "work/final_ig.mp4"
-    yt_mp4 = "work/final_yt.mp4"
     wa_mp4 = "work/final_wa.mp4"
 
-    # Full HD 1080x1920 nítido y optimizado para envío rápido sin exceder límite de Apps Script
+    # Full HD 1080x1920 nítido (~8-12 MB para no saturar Apps Script)
     subprocess.run([
         "ffmpeg", "-y", "-i", unido_mp4, "-vf", vf_final,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "21", "-maxrate", "4500k", "-bufsize", "9000k",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "22", "-maxrate", "3200k", "-bufsize", "6400k",
         "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", ig_mp4
     ], check=True)
 
-    subprocess.run(["ffmpeg", "-y", "-i", ig_mp4, "-c", "copy", yt_mp4], check=True)
-
+    # Versión liviana HD 720x1280 para WhatsApp
     subprocess.run([
         "ffmpeg", "-y", "-i", ig_mp4, "-vf", "scale=720:1280",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "24", "-pix_fmt", "yuv420p",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "25", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", wa_mp4
     ], check=True)
 
-    print(f"Tamaños finales -> IG: {os.path.getsize(ig_mp4)/1024/1024:.1f} MB | WA: {os.path.getsize(wa_mp4)/1024/1024:.1f} MB")
+    print(f"Pesos finales -> FullHD: {os.path.getsize(ig_mp4)/1024/1024:.1f} MB | WA: {os.path.getsize(wa_mp4)/1024/1024:.1f} MB")
 
     def a_b64(path):
         with open(path, "rb") as f:
             return base64.b64encode(f.read()).decode("utf-8")
 
+    # Enviamos ig_tiktok_b64 y whatsapp_b64 (Apps Script usará el mismo FullHD para YouTube sin duplicar peso)
+    ig_b64 = a_b64(ig_mp4)
     payload_vuelta = json.dumps({
         "accion": "guardar_videos",
         "id": row_id,
-        "ig_tiktok_b64": a_b64(ig_mp4),
-        "youtube_b64": a_b64(yt_mp4),
+        "ig_tiktok_b64": ig_b64,
+        "youtube_b64": "",
         "whatsapp_b64": a_b64(wa_mp4)
     }).encode("utf-8")
 
@@ -272,7 +295,7 @@ def main():
         with urllib.request.urlopen(req_back, timeout=120) as resp_back:
             print("Respuesta Apps Script:", resp_back.read().decode("utf-8"))
     except urllib.error.HTTPError as he:
-        print("Error HTTP enviando a Apps Script:", he.code, he.read().decode("utf-8", errors="ignore"))
+        print("Error HTTP Apps Script:", he.code, he.read().decode("utf-8", errors="ignore"))
         raise
 
 if __name__ == "__main__":
