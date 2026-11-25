@@ -6,6 +6,7 @@ import time
 import urllib.request
 import urllib.error
 import subprocess
+import whisper
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request as GoogleAuthRequest
 
@@ -31,10 +32,11 @@ def obtener_token_vertex():
         _cached_creds.refresh(GoogleAuthRequest())
     return _cached_creds.token
 
-def url_vertex(modelo, metodo="generateContent"):
+def url_vertex(modelo, metodo="generateContent", location="us-central1"):
+    host = "aiplatform.googleapis.com" if location == "global" else f"{location}-aiplatform.googleapis.com"
     return (
-        f"https://{GCP_LOCATION}-aiplatform.googleapis.com/v1/projects/{GCP_PROJECT_ID}"
-        f"/locations/{GCP_LOCATION}/publishers/google/models/{modelo}:{metodo}"
+        f"https://{host}/v1/projects/{GCP_PROJECT_ID}"
+        f"/locations/{location}/publishers/google/models/{modelo}:{metodo}"
     )
 
 def limpiar_texto(txt):
@@ -75,42 +77,14 @@ def interpretar_prompt_edicion(prompt_edicion, producto):
 
     plan["prompt_veo"] = (
         f"Vertical 9:16 photorealistic commercial close-up video showing a modern {producto} "
-        f"actively cooking and chopping fresh vegetables in a bright modern kitchen, "
+        f"actively working and operating in a bright modern setting, "
         f"smooth cinematic camera movement, natural lighting, no text or watermarks"
     )
-
-    try:
-        token = obtener_token_vertex()
-        sys_prompt = (
-            f'Analiza esta instruccion de edicion de video: "{prompt_edicion}" para el producto "{producto}". '
-            f'Devuelve SOLO un JSON valido: '
-            f'{{"generar_broll_ia": true, "posicion_broll": 1, '
-            f'"prompt_veo": "Detailed 5-second vertical 9:16 photorealistic commercial video in English showing {producto} actively operating in a bright modern kitchen, smooth cinematic camera motion, natural lighting, no text"}}'
-        )
-        body = json.dumps({
-            "contents": [{"role": "user", "parts": [{"text": sys_prompt}]}],
-            "generationConfig": {"responseMimeType": "application/json"}
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            url_vertex("gemini-2.5-flash", "generateContent"),
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {token}"
-            }
-        )
-        with urllib.request.urlopen(req, timeout=30) as res:
-            data = json.loads(res.read().decode("utf-8"))
-            parsed = json.loads(data["candidates"][0]["content"]["parts"][0]["text"])
-            plan.update(parsed)
-    except Exception as e:
-        print("Aviso Gemini Flash plan:", e)
-
     return plan
 
 def intentar_modelo_veo(modelo, prompt_veo, salida_mp4):
     token = obtener_token_vertex()
-    url = url_vertex(modelo, "predictLongRunning")
+    url = url_vertex(modelo, "predictLongRunning", location="us-central1")
     payload = json.dumps({
         "instances": [{"prompt": prompt_veo}],
         "parameters": {
@@ -133,7 +107,7 @@ def intentar_modelo_veo(modelo, prompt_veo, salida_mp4):
         return False
 
     print(f"Operación Veo iniciada ({modelo}): {op_name}")
-    poll_url = url_vertex(modelo, "fetchPredictOperation")
+    poll_url = url_vertex(modelo, "fetchPredictOperation", location="us-central1")
 
     for _ in range(24):
         time.sleep(8)
@@ -163,95 +137,79 @@ def intentar_modelo_veo(modelo, prompt_veo, salida_mp4):
                         f.write(base64.b64decode(b64_vid))
                     print(f"Escena IA guardada desde {modelo} ({os.path.getsize(salida_mp4)} bytes).")
                     return os.path.exists(salida_mp4) and os.path.getsize(salida_mp4) > 50000
-            print("Respuesta Veo sin bytesBase64Encoded:", json.dumps(resp_obj)[:400])
             return False
     return False
 
 def generar_clip_veo(prompt_veo, salida_mp4):
     if not prompt_veo:
         return False
-
-    for modelo in ["veo-2.0-generate-001", "veo-3.0-generate-001"]:
+    for modelo in ["veo-2.0-generate-001", "veo-3.0-generate-001", "veo-3.0-fast-generate-001"]:
         try:
-            print(f"Probando generación IA en Vertex con {modelo}: {prompt_veo}")
+            print(f"Probando generación IA en Vertex con {modelo}...")
             if intentar_modelo_veo(modelo, prompt_veo, salida_mp4):
                 return True
         except urllib.error.HTTPError as he:
             detalle = he.read().decode("utf-8", errors="ignore")
-            print(f"HTTP Error en {modelo} ({he.code}): {detalle}")
+            print(f"HTTP Error en {modelo} ({he.code}): {detalle[:300]}")
         except Exception as e:
             print(f"Excepción en {modelo}: {e}")
     return False
 
-def formatear_srt_alternado(srt_crudo):
-    bloques = re.split(r'\n\s*\n', srt_crudo.strip())
-    resultado = []
-    for idx, b in enumerate(bloques):
-        lineas = [l.strip() for l in b.splitlines() if l.strip()]
-        if len(lineas) >= 3:
-            num = lineas[0]
-            tiempo = lineas[1]
-            texto = " ".join(lineas[2:])
-            if idx % 2 == 1:
-                texto = f"{{\\c&H00FFFF&}}{texto}{{\\c&HFFFFFF&}}"
-            resultado.append(f"{num}\n{tiempo}\n{texto}")
-    return "\n\n".join(resultado) + "\n"
+def seg_a_srt_time(segundos):
+    ms = int(round((segundos - int(segundos)) * 1000))
+    s = int(segundos)
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
+    return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
 
-def transcribir_audio_a_srt(video_mp4, ruta_srt, producto=""):
-    audio_mp3 = "work/audio_transcripcion.mp3"
+def transcribir_audio_local_whisper(video_mp4, ruta_srt):
+    audio_wav = "work/audio_whisper.wav"
     subprocess.run([
-        "ffmpeg", "-y", "-i", video_mp4, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k", audio_mp3
+        "ffmpeg", "-y", "-i", video_mp4, "-vn", "-ac", "1", "-ar", "16000", audio_wav
     ], check=True)
 
-    with open(audio_mp3, "rb") as f:
-        audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+    print("Cargando modelo Whisper local para transcribir audio...")
+    model = whisper.load_model("base")
+    result = model.transcribe(audio_wav, language="es", word_timestamps=True)
 
-    prompt_srt = (
-        f"Escuchá con precisión el audio de este video comercial en español argentino (sobre {producto}).\n"
-        f"Transcribí EXACTAMENTE las palabras que dicen las personas en el video, sincronizadas segundo a segundo, en formato de subtítulos SRT estándar.\n\n"
-        f"REGLAS OBLIGATORIAS:\n"
-        f"1. Escribí ÚNICAMENTE lo que se escucha en el audio (no inventes texto ni agregues comentarios; si hay silencios, no pongas subtítulos en esos segundos).\n"
-        f"2. Cada bloque debe ser corto (entre 3 y 6 palabras máximo, máximo 25 caracteres por línea) para que entre cómodo en pantalla vertical sin cortarse.\n"
-        f"3. Respetá exactamente los tiempos de inicio y fin de cada frase hablada (formato HH:MM:SS,mmm --> HH:MM:SS,mmm).\n"
-        f"4. Devolvé SOLO el contenido del archivo SRT válido, sin bloques markdown ``` ni texto extra."
-    )
+    bloques = []
+    idx_bloque = 1
 
-    body = json.dumps({
-        "contents": [{
-            "role": "user",
-            "parts": [
-                {"text": prompt_srt},
-                {"inlineData": {"mimeType": "audio/mp3", "data": audio_b64}}
-            ]
-        }],
-        "generationConfig": {"temperature": 0.1}
-    }).encode("utf-8")
+    for seg in result.get("segments", []):
+        palabras = seg.get("words", [])
+        if not palabras:
+            texto = seg.get("text", "").strip()
+            if texto:
+                inicio = seg_a_srt_time(seg["start"])
+                fin = seg_a_srt_time(seg["end"])
+                if idx_bloque % 2 == 0:
+                    texto = f"{{\\c&H00FFFF&}}{texto}{{\\c&HFFFFFF&}}"
+                bloques.append(f"{idx_bloque}\n{inicio} --> {fin}\n{texto}")
+                idx_bloque += 1
+            continue
 
-    try:
-        token = obtener_token_vertex()
-        req = urllib.request.Request(
-            url_vertex("gemini-2.5-flash", "generateContent"),
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {token}"
-            }
-        )
-        with urllib.request.urlopen(req, timeout=60) as res:
-            data = json.loads(res.read().decode("utf-8"))
-            srt_txt = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            srt_txt = re.sub(r'^```[a-zA-Z]*\n?', '', srt_txt)
-            srt_txt = re.sub(r'\n?```$', '', srt_txt).strip()
-            if "-->" in srt_txt:
-                srt_final = formatear_srt_alternado(srt_txt)
-                with open(ruta_srt, "w", encoding="utf-8") as f:
-                    f.write(srt_final)
-                print("Transcripción SRT generada OK:\n", srt_final[:500])
-                return True
-    except urllib.error.HTTPError as he:
-        print("Error HTTP transcribiendo audio:", he.code, he.read().decode("utf-8", errors="ignore"))
-    except Exception as e:
-        print("Error transcribiendo audio:", e)
+        # Agrupar de a 4 palabras para subtitulos dinamicos tipo Reels/TikTok
+        for i in range(0, len(palabras), 4):
+            grupo = palabras[i:i+4]
+            texto = " ".join(w["word"].strip() for w in grupo).strip()
+            if not texto:
+                continue
+            inicio = seg_a_srt_time(grupo[0]["start"])
+            fin = seg_a_srt_time(grupo[-1]["end"])
+            if idx_bloque % 2 == 0:
+                texto = f"{{\\c&H00FFFF&}}{texto}{{\\c&HFFFFFF&}}"
+            bloques.append(f"{idx_bloque}\n{inicio} --> {fin}\n{texto}")
+            idx_bloque += 1
+
+    if bloques:
+        srt_final = "\n\n".join(bloques) + "\n"
+        with open(ruta_srt, "w", encoding="utf-8") as f:
+            f.write(srt_final)
+        print(f"Subtitulos Whisper generados OK ({len(bloques)} bloques).")
+        return True
+
+    print("No se detecto voz en el audio.")
     return False
 
 def normalizar_clip(entrada, salida, w=1080, h=1920):
@@ -333,9 +291,9 @@ def main():
     ]
 
     ruta_srt = "work/subtitulos.srt"
-    if transcribir_audio_a_srt(unido_mp4, ruta_srt, producto):
+    if transcribir_audio_local_whisper(unido_mp4, ruta_srt):
         estilo_sub = (
-            "FontName=Liberation Sans,FontSize=14,Bold=1,"
+            "FontName=Liberation Sans,FontSize=15,Bold=1,"
             "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H00000000,"
             "BorderStyle=1,Outline=2,Shadow=1,Alignment=2,"
             "MarginL=35,MarginR=35,MarginV=125"
