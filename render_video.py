@@ -501,4 +501,91 @@ def main():
     generar_musica_fondo_suave(dur_contenido, dur_total, bgm_wav)
     unido_musica_mp4 = "work/unido_musica.mp4"
     subprocess.run([
-        "ffmpeg", "-y", "-i", unido_mp4, "-i", bgm
+        "ffmpeg", "-y", "-i", unido_mp4, "-i", bgm_wav,
+        "-filter_complex",
+        "[0:a]volume=1.05[voz];[1:a]volume=0.14[mus];[voz][mus]amix=inputs=2:duration=first:dropout_transition=2[aout]",
+        "-map", "0:v", "-map", "[aout]",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
+        unido_musica_mp4
+    ], check=True)
+    unido_mp4 = unido_musica_mp4
+
+    filtros = [
+        "drawbox=x=0:y=0:w=iw:h=ih:color=black@0.17:t=fill",
+        f"drawtext=fontfile={font_bold}:text='CASA DION':fontcolor=white@0.28:fontsize=34:x=w-tw-45:y=55"
+    ]
+
+    ruta_srt = "work/subtitulos.srt"
+    if transcribir_audio_local_whisper(unido_mp4, ruta_srt, producto):
+        estilo_sub = (
+            "FontName=Liberation Sans,FontSize=15,Bold=1,"
+            "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H00000000,"
+            "BorderStyle=1,Outline=2,Shadow=1,Alignment=2,"
+            "MarginL=35,MarginR=35,MarginV=125"
+        )
+        filtros.append(f"subtitles={ruta_srt}:force_style='{estilo_sub}'")
+
+    vf_final = ",".join(filtros)
+
+    ig_mp4 = "work/final_ig.mp4"
+    yt_mp4 = "work/final_yt.mp4"
+    wa_mp4 = "work/final_wa.mp4"
+
+    # 1) Instagram / TikTok (1080x1920 vertical)
+    subprocess.run([
+        "ffmpeg", "-y", "-i", unido_mp4, "-vf", vf_final,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "19", "-maxrate", "6500k", "-bufsize", "13000k",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", ig_mp4
+    ], check=True)
+
+    # 2) YouTube (1920x1080 horizontal 16:9 con fondo difuminado elegante + video central nitido)
+    subprocess.run([
+        "ffmpeg", "-y", "-i", ig_mp4,
+        "-filter_complex",
+        "[0:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,boxblur=25:5,eq=brightness=-0.15[bg];"
+        "[0:v]scale=-2:1080[fg];"
+        "[bg][fg]overlay=(W-w)/2:0[vyt]",
+        "-map", "[vyt]", "-map", "0:a",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-maxrate", "6000k", "-bufsize", "12000k",
+        "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", yt_mp4
+    ], check=True)
+
+    # 3) WhatsApp (720x1280 liviano)
+    subprocess.run([
+        "ffmpeg", "-y", "-i", ig_mp4, "-vf", "scale=720:1280",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", wa_mp4
+    ], check=True)
+
+    print(
+        f"Pesos finales -> IG/TikTok: {os.path.getsize(ig_mp4)/1024/1024:.1f} MB | "
+        f"YouTube: {os.path.getsize(yt_mp4)/1024/1024:.1f} MB | "
+        f"WA: {os.path.getsize(wa_mp4)/1024/1024:.1f} MB"
+    )
+
+    def a_b64(path):
+        with open(path, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
+
+    payload_vuelta = json.dumps({
+        "accion": "guardar_videos",
+        "id": row_id,
+        "ig_tiktok_b64": a_b64(ig_mp4),
+        "youtube_b64": a_b64(yt_mp4),
+        "whatsapp_b64": a_b64(wa_mp4)
+    }).encode("utf-8")
+
+    req_back = urllib.request.Request(
+        APPS_SCRIPT_URL,
+        data=payload_vuelta,
+        headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req_back, timeout=120) as resp_back:
+            print("Respuesta Apps Script:", resp_back.read().decode("utf-8"))
+    except urllib.error.HTTPError as he:
+        print("Error HTTP Apps Script:", he.code, he.read().decode("utf-8", errors="ignore"))
+        raise
+
+if __name__ == "__main__":
+    main()
