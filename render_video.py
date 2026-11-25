@@ -1,5 +1,6 @@
 import os
 import re
+import glob
 import math
 import wave
 import struct
@@ -49,6 +50,20 @@ def limpiar_texto(txt):
     txt = re.sub(r'[*_~`#<>|]', '', txt)
     txt = re.sub(r'[^\w\sáéíóúÁÉÍÓÚñÑüÜ.,:;!?¡¿$%()/-]', '', txt)
     return re.sub(r'\s+', ' ', txt).strip()
+
+def buscar_archivo_logo():
+    prioritarios = [
+        "casa dion.pdf.png", "logo.png", "logo.jpg", "logo.jpeg",
+        "assets/logo.png", "assets/logo.jpg"
+    ]
+    for p in prioritarios:
+        if os.path.exists(p):
+            return p
+    for ext in ("*.png", "*.jpg", "*.jpeg"):
+        encontrados = sorted(glob.glob(ext))
+        if encontrados:
+            return encontrados[0]
+    return ""
 
 def descargar_drive(file_id, destino):
     url = f"https://drive.google.com/uc?export=download&id={file_id}"
@@ -106,7 +121,7 @@ def extraer_frame_referencia(clips_norm, salida_jpg):
             return base64.b64encode(f.read()).decode("utf-8")
     return ""
 
-def intentar_modelo_veo(modelo, prompt_veo, salida_mp4, img_ref_b64=""):
+def intentar_modelo_veo(modelo, prompt_veo, salida_mp4, img_ref_b64="", duracion_seg=6):
     token = obtener_token_vertex()
     url = url_vertex(modelo, "predictLongRunning", location="us-central1")
     instancia = {"prompt": prompt_veo}
@@ -122,7 +137,7 @@ def intentar_modelo_veo(modelo, prompt_veo, salida_mp4, img_ref_b64=""):
             "aspectRatio": "9:16",
             "sampleCount": 1,
             "generateAudio": False,
-            "durationSeconds": 6
+            "durationSeconds": duracion_seg
         }
     }).encode("utf-8")
 
@@ -174,20 +189,20 @@ def intentar_modelo_veo(modelo, prompt_veo, salida_mp4, img_ref_b64=""):
             return False
     return False
 
-def generar_clip_veo(prompt_veo, salida_mp4, img_ref_b64=""):
+def generar_clip_veo(prompt_veo, salida_mp4, img_ref_b64="", duracion_seg=6):
     if not prompt_veo:
         return False
     for modelo in ["veo-3.1-fast-generate-001", "veo-3.1-generate-001", "veo-3.1-lite-generate-001"]:
         try:
             print(f"Probando generación IA en Vertex con {modelo}...")
-            if intentar_modelo_veo(modelo, prompt_veo, salida_mp4, img_ref_b64):
+            if intentar_modelo_veo(modelo, prompt_veo, salida_mp4, img_ref_b64, duracion_seg):
                 return True
         except urllib.error.HTTPError as he:
             detalle = he.read().decode("utf-8", errors="ignore")
             print(f"HTTP Error en {modelo} ({he.code}): {detalle[:300]}")
             if img_ref_b64 and he.code == 400:
                 try:
-                    if intentar_modelo_veo(modelo, prompt_veo, salida_mp4, ""):
+                    if intentar_modelo_veo(modelo, prompt_veo, salida_mp4, "", duracion_seg):
                         return True
                 except Exception as e2:
                     print(f"Reintento texto en {modelo} fallo: {e2}")
@@ -203,10 +218,9 @@ def obtener_duracion(ruta_mp4):
     out = subprocess.check_output(cmd).decode("utf-8").strip()
     return float(out)
 
-def generar_musica_fondo_suave(duracion_seg, salida_wav):
+def generar_musica_fondo_suave(duracion_voz, duracion_total, salida_wav):
     sr = 44100
-    total_samples = int((duracion_seg + 1.0) * sr)
-    # Progresion calida comercial (Fmaj7 -> Em7 -> Dm7 -> Cmaj7)
+    total_samples = int((duracion_total + 0.5) * sr)
     acordes = [
         [174.61, 220.00, 261.63, 329.63],
         [164.81, 196.00, 246.94, 293.66],
@@ -224,16 +238,88 @@ def generar_musica_fondo_suave(duracion_seg, salida_wav):
             idx_acorde = int(t / dur_compas) % len(acordes)
             t_local = t % dur_compas
             env_compas = math.sin(math.pi * min(1.0, t_local / dur_compas)) ** 0.5
-            env_global = min(1.0, t / 1.5) * min(1.0, max(0.0, (duracion_seg - t) / 2.0))
+            env_global = min(1.0, t / 1.2) * min(1.0, max(0.0, (duracion_total - t) / 1.5))
+
+            # Sube suavemente el protagonismo de la musica durante la placa final del logo
+            boost_outro = 1.0
+            if t > duracion_voz:
+                progreso_outro = min(1.0, (t - duracion_voz) / 0.6)
+                boost_outro = 1.0 + 0.85 * progreso_outro
+
             freqs = acordes[idx_acorde]
             val = 0.0
             for f in freqs:
                 val += math.sin(2.0 * math.pi * f * t) * 0.18
-                val += math.sin(2.0 * math.pi * (f * 2.0) * t) * 0.03
+                val += math.sin(2.0 * math.pi * (f * 2.0) * t) * 0.035
             pulso = 0.85 + 0.15 * math.sin(2.0 * math.pi * (2.0 / dur_compas) * t_local)
-            muestra = int(max(-32767, min(32767, val * env_compas * env_global * pulso * 11000)))
+            muestra = int(max(-32767, min(32767, val * env_compas * env_global * pulso * boost_outro * 11500)))
             frames.extend(struct.pack("<hh", muestra, muestra))
         wf.writeframes(frames)
+
+def crear_outro_logo_3d(salida_mp4, font_bold, duracion=3.0):
+    ruta_logo = buscar_archivo_logo()
+    if ruta_logo:
+        print(f"Preparando outro 3D profesional con logo: {ruta_logo}")
+        # Componemos el logo centrado sobre fondo negro puro en 1080x1920 para pasarlo a Veo 3.1
+        logo_card_jpg = "work/logo_card_9x16.jpg"
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", "color=c=black:s=1080x1920",
+            "-i", ruta_logo,
+            "-filter_complex", "[1:v]scale=660:-1[lg];[0:v][lg]overlay=(W-w)/2:(H-h)/2",
+            "-frames:v", "1", "-q:v", "2", logo_card_jpg
+        ], check=True)
+
+        with open(logo_card_jpg, "rb") as f:
+            logo_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+        prompt_logo_3d = (
+            "Vertical 9:16 sleek luxury commercial brand outro on a pure pitch-black background. "
+            "The exact brand logo from the image smoothly emerges in glossy 3D metallic relief with subtle depth, "
+            "a soft golden-white specular light sweep gliding across the emblem, gentle cinematic 3D camera push-in, "
+            "high contrast, clean studio lighting, no extra text, completely silent."
+        )
+
+        veo_logo_raw = "work/veo_logo_raw.mp4"
+        if generar_clip_veo(prompt_logo_3d, veo_logo_raw, logo_b64, duracion_seg=4):
+            subprocess.run([
+                "ffmpeg", "-y", "-i", veo_logo_raw,
+                "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                "-t", str(duracion),
+                "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fade=t=in:st=0:d=0.45,setsar=1,fps=30,format=yuv420p",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "19",
+                "-c:a", "aac", "-b:a", "160k", "-ar", "44100", "-ac", "2",
+                salida_mp4
+            ], check=True)
+            print("Outro 3D del logo generado con Veo 3.1 Fast OK.")
+            return
+
+        # Respaldo cinematografico en FFmpeg (zoom-in progresivo + fundido limpio)
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-loop", "1", "-t", str(duracion), "-i", logo_card_jpg,
+            "-f", "lavfi", "-t", str(duracion), "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+            "-vf",
+            "zoompan=z='min(zoom+0.0018,1.14)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=90:s=1080x1920:fps=30,"
+            "fade=t=in:st=0:d=0.5,format=yuv420p",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "19",
+            "-c:a", "aac", "-b:a", "160k", "-ar", "44100", "-ac", "2",
+            salida_mp4
+        ], check=True)
+    else:
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", f"color=c=black:s=1080x1920:r=30:d={duracion}",
+            "-f", "lavfi", "-t", str(duracion), "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+            "-vf",
+            f"drawtext=fontfile={font_bold}:text='CASA DION':fontcolor=white:fontsize=86:x=(w-tw)/2:y=(h-th)/2-30,"
+            f"drawtext=fontfile={font_bold}:text='HERRAMIENTAS Y HOGAR':fontcolor=#FFD700:fontsize=32:x=(w-tw)/2:y=(h-th)/2+55,"
+            f"fade=t=in:st=0:d=0.5,format=yuv420p",
+            "-map", "0:v", "-map", "1:a",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "19",
+            "-c:a", "aac", "-b:a", "160k", "-ar", "44100", "-ac", "2",
+            salida_mp4
+        ], check=True)
 
 def seg_a_srt_time(segundos):
     ms = int(round((segundos - int(segundos)) * 1000))
@@ -388,101 +474,31 @@ def main():
                 unido_mp4 = unido_broll_mp4
                 print(f"Escena IA aplicada como B-roll final desde {inicio_broll:.1f}s.")
 
-    # Mezclar musica leve de fondo debajo de la voz original
-    dur_total = obtener_duracion(unido_mp4)
-    bgm_wav = "work/bgm.wav"
-    generar_musica_fondo_suave(dur_total, bgm_wav)
-    unido_musica_mp4 = "work/unido_musica.mp4"
-    subprocess.run([
-        "ffmpeg", "-y", "-i", unido_mp4, "-i", bgm_wav,
-        "-filter_complex",
-        "[0:a]volume=1.05[voz];[1:a]volume=0.14[mus];[voz][mus]amix=inputs=2:duration=first:dropout_transition=2[aout]",
-        "-map", "0:v", "-map", "[aout]",
-        "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
-        unido_musica_mp4
-    ], check=True)
-    unido_mp4 = unido_musica_mp4
+    dur_contenido = obtener_duracion(unido_mp4)
 
     font_bold = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
     if not os.path.exists(font_bold):
         font_bold = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
-    filtros = [
-        "drawbox=x=0:y=0:w=iw:h=ih:color=black@0.17:t=fill",
-        f"drawtext=fontfile={font_bold}:text='CASA DION':fontcolor=white@0.28:fontsize=34:x=w-tw-45:y=55"
-    ]
+    # Crear outro negro 3D con logo al final (3.0s) y pegarlo al video
+    outro_mp4 = "work/outro_logo.mp4"
+    crear_outro_logo_3d(outro_mp4, font_bold, duracion=3.0)
+    concat_outro = "work/lista_outro.txt"
+    with open(concat_outro, "w", encoding="utf-8") as f:
+        f.write(f"file '{os.path.abspath(unido_mp4)}'\n")
+        f.write(f"file '{os.path.abspath(outro_mp4)}'\n")
 
-    ruta_srt = "work/subtitulos.srt"
-    if transcribir_audio_local_whisper(unido_mp4, ruta_srt, producto):
-        estilo_sub = (
-            "FontName=Liberation Sans,FontSize=15,Bold=1,"
-            "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H00000000,"
-            "BorderStyle=1,Outline=2,Shadow=1,Alignment=2,"
-            "MarginL=35,MarginR=35,MarginV=125"
-        )
-        filtros.append(f"subtitles={ruta_srt}:force_style='{estilo_sub}'")
-
-    vf_final = ",".join(filtros)
-
-    ig_mp4 = "work/final_ig.mp4"
-    yt_mp4 = "work/final_yt.mp4"
-    wa_mp4 = "work/final_wa.mp4"
-
-    # 1) Instagram / TikTok (1080x1920 vertical)
+    unido_con_outro = "work/unido_con_outro.mp4"
     subprocess.run([
-        "ffmpeg", "-y", "-i", unido_mp4, "-vf", vf_final,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "19", "-maxrate", "6500k", "-bufsize", "13000k",
-        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", ig_mp4
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_outro,
+        "-c", "copy", unido_con_outro
     ], check=True)
+    unido_mp4 = unido_con_outro
 
-    # 2) YouTube (1920x1080 horizontal 16:9 con fondo difuminado elegante + video central nitido)
+    # Mezclar musica leve de fondo debajo de la voz y subiendo suavemente durante los 3s finales del logo
+    dur_total = obtener_duracion(unido_mp4)
+    bgm_wav = "work/bgm.wav"
+    generar_musica_fondo_suave(dur_contenido, dur_total, bgm_wav)
+    unido_musica_mp4 = "work/unido_musica.mp4"
     subprocess.run([
-        "ffmpeg", "-y", "-i", ig_mp4,
-        "-filter_complex",
-        "[0:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,boxblur=25:5,eq=brightness=-0.15[bg];"
-        "[0:v]scale=-2:1080[fg];"
-        "[bg][fg]overlay=(W-w)/2:0[vyt]",
-        "-map", "[vyt]", "-map", "0:a",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-maxrate", "6000k", "-bufsize", "12000k",
-        "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", yt_mp4
-    ], check=True)
-
-    # 3) WhatsApp (720x1280 liviano)
-    subprocess.run([
-        "ffmpeg", "-y", "-i", ig_mp4, "-vf", "scale=720:1280",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", wa_mp4
-    ], check=True)
-
-    print(
-        f"Pesos finales -> IG/TikTok: {os.path.getsize(ig_mp4)/1024/1024:.1f} MB | "
-        f"YouTube: {os.path.getsize(yt_mp4)/1024/1024:.1f} MB | "
-        f"WA: {os.path.getsize(wa_mp4)/1024/1024:.1f} MB"
-    )
-
-    def a_b64(path):
-        with open(path, "rb") as f:
-            return base64.b64encode(f.read()).decode("utf-8")
-
-    payload_vuelta = json.dumps({
-        "accion": "guardar_videos",
-        "id": row_id,
-        "ig_tiktok_b64": a_b64(ig_mp4),
-        "youtube_b64": a_b64(yt_mp4),
-        "whatsapp_b64": a_b64(wa_mp4)
-    }).encode("utf-8")
-
-    req_back = urllib.request.Request(
-        APPS_SCRIPT_URL,
-        data=payload_vuelta,
-        headers={"Content-Type": "application/json"}
-    )
-    try:
-        with urllib.request.urlopen(req_back, timeout=120) as resp_back:
-            print("Respuesta Apps Script:", resp_back.read().decode("utf-8"))
-    except urllib.error.HTTPError as he:
-        print("Error HTTP Apps Script:", he.code, he.read().decode("utf-8", errors="ignore"))
-        raise
-
-if __name__ == "__main__":
-    main()
+        "ffmpeg", "-y", "-i", unido_mp4, "-i", bgm
