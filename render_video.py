@@ -1,5 +1,8 @@
 import os
 import re
+import math
+import wave
+import struct
 import json
 import base64
 import time
@@ -93,7 +96,6 @@ def interpretar_prompt_edicion(prompt_edicion, producto):
     return plan
 
 def extraer_frame_referencia(clips_norm, salida_jpg):
-    # Extrae un frame del medio del segundo o tercer clip (donde suelen mostrar la caja/producto)
     clip_ref = clips_norm[1] if len(clips_norm) > 1 else clips_norm[0]
     subprocess.run([
         "ffmpeg", "-y", "-ss", "00:00:02", "-i", clip_ref,
@@ -177,13 +179,12 @@ def generar_clip_veo(prompt_veo, salida_mp4, img_ref_b64=""):
         return False
     for modelo in ["veo-3.1-fast-generate-001", "veo-3.1-generate-001", "veo-3.1-lite-generate-001"]:
         try:
-            print(f"Probando generación IA en Vertex con {modelo} (con imagen ref: {bool(img_ref_b64)})...")
+            print(f"Probando generación IA en Vertex con {modelo}...")
             if intentar_modelo_veo(modelo, prompt_veo, salida_mp4, img_ref_b64):
                 return True
         except urllib.error.HTTPError as he:
             detalle = he.read().decode("utf-8", errors="ignore")
             print(f"HTTP Error en {modelo} ({he.code}): {detalle[:300]}")
-            # Si rechaza image-to-video por seguridad/filtro, reintentamos solo con texto
             if img_ref_b64 and he.code == 400:
                 try:
                     if intentar_modelo_veo(modelo, prompt_veo, salida_mp4, ""):
@@ -201,6 +202,38 @@ def obtener_duracion(ruta_mp4):
     ]
     out = subprocess.check_output(cmd).decode("utf-8").strip()
     return float(out)
+
+def generar_musica_fondo_suave(duracion_seg, salida_wav):
+    sr = 44100
+    total_samples = int((duracion_seg + 1.0) * sr)
+    # Progresion calida comercial (Fmaj7 -> Em7 -> Dm7 -> Cmaj7)
+    acordes = [
+        [174.61, 220.00, 261.63, 329.63],
+        [164.81, 196.00, 246.94, 293.66],
+        [146.83, 174.61, 220.00, 261.63],
+        [130.81, 164.81, 196.00, 246.94],
+    ]
+    dur_compas = 3.2
+    with wave.open(salida_wav, "w") as wf:
+        wf.setnchannels(2)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        frames = bytearray()
+        for n in range(total_samples):
+            t = n / sr
+            idx_acorde = int(t / dur_compas) % len(acordes)
+            t_local = t % dur_compas
+            env_compas = math.sin(math.pi * min(1.0, t_local / dur_compas)) ** 0.5
+            env_global = min(1.0, t / 1.5) * min(1.0, max(0.0, (duracion_seg - t) / 2.0))
+            freqs = acordes[idx_acorde]
+            val = 0.0
+            for f in freqs:
+                val += math.sin(2.0 * math.pi * f * t) * 0.18
+                val += math.sin(2.0 * math.pi * (f * 2.0) * t) * 0.03
+            pulso = 0.85 + 0.15 * math.sin(2.0 * math.pi * (2.0 / dur_compas) * t_local)
+            muestra = int(max(-32767, min(32767, val * env_compas * env_global * pulso * 11000)))
+            frames.extend(struct.pack("<hh", muestra, muestra))
+        wf.writeframes(frames)
 
 def seg_a_srt_time(segundos):
     ms = int(round((segundos - int(segundos)) * 1000))
@@ -313,7 +346,6 @@ def main():
     if not clips_norm:
         raise RuntimeError("No se encontraron clips validos.")
 
-    # Primero unimos los clips reales de las chicas (con sus voces originales intactas)
     concat_txt = "work/lista.txt"
     with open(concat_txt, "w", encoding="utf-8") as f:
         for c in clips_norm:
@@ -327,7 +359,6 @@ def main():
 
     unido_mp4 = unido_real_mp4
 
-    # Si corresponde escena IA, la ponemos AL FINAL superponiendo la imagen de Veo sobre los ultimos segundos de la voz de la chica
     plan = interpretar_prompt_edicion(prompt_edicion, producto)
     if plan.get("generar_broll_ia"):
         veo_raw = "work/veo_raw.mp4"
@@ -342,7 +373,6 @@ def main():
 
             dur_real = obtener_duracion(unido_real_mp4)
             dur_veo = obtener_duracion(veo_norm)
-            # Reemplazamos los ultimos segundos de imagen por el clip de Veo, manteniendo SIEMPRE la voz de la chica
             if dur_real > dur_veo + 3.0:
                 inicio_broll = dur_real - dur_veo
                 unido_broll_mp4 = "work/unido_broll.mp4"
@@ -356,7 +386,22 @@ def main():
                     "-c:a", "copy", unido_broll_mp4
                 ], check=True)
                 unido_mp4 = unido_broll_mp4
-                print(f"Escena IA aplicada como B-roll final desde {inicio_broll:.1f}s manteniendo voz original.")
+                print(f"Escena IA aplicada como B-roll final desde {inicio_broll:.1f}s.")
+
+    # Mezclar musica leve de fondo debajo de la voz original
+    dur_total = obtener_duracion(unido_mp4)
+    bgm_wav = "work/bgm.wav"
+    generar_musica_fondo_suave(dur_total, bgm_wav)
+    unido_musica_mp4 = "work/unido_musica.mp4"
+    subprocess.run([
+        "ffmpeg", "-y", "-i", unido_mp4, "-i", bgm_wav,
+        "-filter_complex",
+        "[0:a]volume=1.05[voz];[1:a]volume=0.14[mus];[voz][mus]amix=inputs=2:duration=first:dropout_transition=2[aout]",
+        "-map", "0:v", "-map", "[aout]",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
+        unido_musica_mp4
+    ], check=True)
+    unido_mp4 = unido_musica_mp4
 
     font_bold = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
     if not os.path.exists(font_bold):
@@ -380,21 +425,40 @@ def main():
     vf_final = ",".join(filtros)
 
     ig_mp4 = "work/final_ig.mp4"
+    yt_mp4 = "work/final_yt.mp4"
     wa_mp4 = "work/final_wa.mp4"
 
+    # 1) Instagram / TikTok (1080x1920 vertical)
     subprocess.run([
         "ffmpeg", "-y", "-i", unido_mp4, "-vf", vf_final,
         "-c:v", "libx264", "-preset", "fast", "-crf", "19", "-maxrate", "6500k", "-bufsize", "13000k",
         "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", ig_mp4
     ], check=True)
 
+    # 2) YouTube (1920x1080 horizontal 16:9 con fondo difuminado elegante + video central nitido)
+    subprocess.run([
+        "ffmpeg", "-y", "-i", ig_mp4,
+        "-filter_complex",
+        "[0:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,boxblur=25:5,eq=brightness=-0.15[bg];"
+        "[0:v]scale=-2:1080[fg];"
+        "[bg][fg]overlay=(W-w)/2:0[vyt]",
+        "-map", "[vyt]", "-map", "0:a",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-maxrate", "6000k", "-bufsize", "12000k",
+        "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", yt_mp4
+    ], check=True)
+
+    # 3) WhatsApp (720x1280 liviano)
     subprocess.run([
         "ffmpeg", "-y", "-i", ig_mp4, "-vf", "scale=720:1280",
         "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", wa_mp4
     ], check=True)
 
-    print(f"Pesos finales -> FullHD: {os.path.getsize(ig_mp4)/1024/1024:.1f} MB | WA: {os.path.getsize(wa_mp4)/1024/1024:.1f} MB")
+    print(
+        f"Pesos finales -> IG/TikTok: {os.path.getsize(ig_mp4)/1024/1024:.1f} MB | "
+        f"YouTube: {os.path.getsize(yt_mp4)/1024/1024:.1f} MB | "
+        f"WA: {os.path.getsize(wa_mp4)/1024/1024:.1f} MB"
+    )
 
     def a_b64(path):
         with open(path, "rb") as f:
@@ -404,7 +468,7 @@ def main():
         "accion": "guardar_videos",
         "id": row_id,
         "ig_tiktok_b64": a_b64(ig_mp4),
-        "youtube_b64": "",
+        "youtube_b64": a_b64(yt_mp4),
         "whatsapp_b64": a_b64(wa_mp4)
     }).encode("utf-8")
 
