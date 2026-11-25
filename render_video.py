@@ -6,16 +6,36 @@ import time
 import urllib.request
 import urllib.error
 import subprocess
+from google.oauth2 import service_account
+from google.auth.transport.requests import Request as GoogleAuthRequest
 
 APPS_SCRIPT_URL = os.environ.get("APPS_SCRIPT_URL", "").strip()
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GCP_SA_KEY = os.environ.get("GCP_SA_KEY", "").strip()
 EVENT_PATH = os.environ.get("GITHUB_EVENT_PATH", "")
+GCP_PROJECT_ID = "active-alcove-504517-h8"
+GCP_LOCATION = "us-central1"
 
-def es_clave_vertex():
-    return False
+_cached_creds = None
 
-def url_gemini(modelo, metodo="generateContent"):
-    return f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:{metodo}?key={GEMINI_API_KEY}"
+def obtener_token_vertex():
+    global _cached_creds
+    if not GCP_SA_KEY:
+        raise RuntimeError("Falta GCP_SA_KEY en los Secrets de GitHub.")
+    if _cached_creds is None:
+        info = json.loads(GCP_SA_KEY)
+        _cached_creds = service_account.Credentials.from_service_account_info(
+            info,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+    if not _cached_creds.valid or _cached_creds.expired:
+        _cached_creds.refresh(GoogleAuthRequest())
+    return _cached_creds.token
+
+def url_vertex(modelo, metodo="generateContent"):
+    return (
+        f"https://{GCP_LOCATION}-aiplatform.googleapis.com/v1/projects/{GCP_PROJECT_ID}"
+        f"/locations/{GCP_LOCATION}/publishers/google/models/{modelo}:{metodo}"
+    )
 
 def limpiar_texto(txt):
     if not txt:
@@ -59,10 +79,8 @@ def interpretar_prompt_edicion(prompt_edicion, producto):
         f"smooth cinematic camera movement, natural lighting, no text or watermarks"
     )
 
-    if not GEMINI_API_KEY:
-        return plan
-
     try:
+        token = obtener_token_vertex()
         sys_prompt = (
             f'Analiza esta instruccion de edicion de video: "{prompt_edicion}" para el producto "{producto}". '
             f'Devuelve SOLO un JSON valido: '
@@ -74,9 +92,12 @@ def interpretar_prompt_edicion(prompt_edicion, producto):
             "generationConfig": {"responseMimeType": "application/json"}
         }).encode("utf-8")
         req = urllib.request.Request(
-            url_gemini("gemini-2.5-flash", "generateContent"),
+            url_vertex("gemini-2.5-flash", "generateContent"),
             data=body,
-            headers={"Content-Type": "application/json"}
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}"
+            }
         )
         with urllib.request.urlopen(req, timeout=30) as res:
             data = json.loads(res.read().decode("utf-8"))
@@ -88,12 +109,23 @@ def interpretar_prompt_edicion(prompt_edicion, producto):
     return plan
 
 def intentar_modelo_veo(modelo, prompt_veo, salida_mp4):
-    url = url_gemini(modelo, "predictLongRunning")
+    token = obtener_token_vertex()
+    url = url_vertex(modelo, "predictLongRunning")
     payload = json.dumps({
         "instances": [{"prompt": prompt_veo}],
-        "parameters": {"aspectRatio": "9:16"}
+        "parameters": {
+            "aspectRatio": "9:16",
+            "sampleCount": 1
+        }
     }).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}"
+        }
+    )
     with urllib.request.urlopen(req, timeout=30) as res:
         op = json.loads(res.read().decode("utf-8"))
     op_name = op.get("name")
@@ -101,13 +133,20 @@ def intentar_modelo_veo(modelo, prompt_veo, salida_mp4):
         return False
 
     print(f"Operación Veo iniciada ({modelo}): {op_name}")
-    poll_base = "https://generativelanguage.googleapis.com/v1beta"
+    poll_url = url_vertex(modelo, "fetchPredictOperation")
 
-    for _ in range(22):
+    for _ in range(24):
         time.sleep(8)
-        poll_url = f"{poll_base}/{op_name}?key={GEMINI_API_KEY}"
-        poll_req = urllib.request.Request(poll_url)
-
+        token = obtener_token_vertex()
+        poll_body = json.dumps({"operationName": op_name}).encode("utf-8")
+        poll_req = urllib.request.Request(
+            poll_url,
+            data=poll_body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}"
+            }
+        )
         with urllib.request.urlopen(poll_req, timeout=30) as p_res:
             status = json.loads(p_res.read().decode("utf-8"))
 
@@ -116,29 +155,25 @@ def intentar_modelo_veo(modelo, prompt_veo, salida_mp4):
                 print(f"Error interno en operación {modelo}:", status["error"])
                 return False
             resp_obj = status.get("response", {})
-            samples = (
-                resp_obj.get("generateVideoResponse", {}).get("generatedSamples", [])
-                or resp_obj.get("generatedVideos", [])
-            )
-            if samples:
-                vid_uri = samples[0].get("video", {}).get("uri", "")
-                if vid_uri:
-                    sep = "&" if "?" in vid_uri else "?"
-                    dl_url = f"{vid_uri}{sep}key={GEMINI_API_KEY}"
-                    urllib.request.urlretrieve(dl_url, salida_mp4)
-                    print(f"Escena IA descargada desde {modelo} ({os.path.getsize(salida_mp4)} bytes).")
+            videos = resp_obj.get("videos", [])
+            if videos:
+                b64_vid = videos[0].get("bytesBase64Encoded", "")
+                if b64_vid:
+                    with open(salida_mp4, "wb") as f:
+                        f.write(base64.b64decode(b64_vid))
+                    print(f"Escena IA guardada desde {modelo} ({os.path.getsize(salida_mp4)} bytes).")
                     return os.path.exists(salida_mp4) and os.path.getsize(salida_mp4) > 50000
-            print("Respuesta Veo sin bytes:", json.dumps(resp_obj)[:400])
+            print("Respuesta Veo sin bytesBase64Encoded:", json.dumps(resp_obj)[:400])
             return False
     return False
 
 def generar_clip_veo(prompt_veo, salida_mp4):
-    if not GEMINI_API_KEY or not prompt_veo:
+    if not prompt_veo:
         return False
 
-    for modelo in ["veo-3.0-generate-001", "veo-2.0-generate-001"]:
+    for modelo in ["veo-2.0-generate-001", "veo-3.0-generate-001"]:
         try:
-            print(f"Probando generación IA con {modelo}: {prompt_veo}")
+            print(f"Probando generación IA en Vertex con {modelo}: {prompt_veo}")
             if intentar_modelo_veo(modelo, prompt_veo, salida_mp4):
                 return True
         except urllib.error.HTTPError as he:
@@ -163,8 +198,6 @@ def formatear_srt_alternado(srt_crudo):
     return "\n\n".join(resultado) + "\n"
 
 def transcribir_audio_a_srt(video_mp4, ruta_srt, producto=""):
-    if not GEMINI_API_KEY:
-        return False
     audio_mp3 = "work/audio_transcripcion.mp3"
     subprocess.run([
         "ffmpeg", "-y", "-i", video_mp4, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k", audio_mp3
@@ -188,17 +221,21 @@ def transcribir_audio_a_srt(video_mp4, ruta_srt, producto=""):
             "role": "user",
             "parts": [
                 {"text": prompt_srt},
-                {"inline_data": {"mime_type": "audio/mp3", "data": audio_b64}}
+                {"inlineData": {"mimeType": "audio/mp3", "data": audio_b64}}
             ]
         }],
         "generationConfig": {"temperature": 0.1}
     }).encode("utf-8")
 
     try:
+        token = obtener_token_vertex()
         req = urllib.request.Request(
-            url_gemini("gemini-2.5-flash", "generateContent"),
+            url_vertex("gemini-2.5-flash", "generateContent"),
             data=body,
-            headers={"Content-Type": "application/json"}
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}"
+            }
         )
         with urllib.request.urlopen(req, timeout=60) as res:
             data = json.loads(res.read().decode("utf-8"))
