@@ -12,11 +12,9 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 EVENT_PATH = os.environ.get("GITHUB_EVENT_PATH", "")
 
 def es_clave_vertex():
-    return GEMINI_API_KEY.startswith("AQ.")
+    return False
 
 def url_gemini(modelo, metodo="generateContent"):
-    if es_clave_vertex():
-        return f"https://aiplatform.googleapis.com/v1/publishers/google/models/{modelo}:{metodo}?key={GEMINI_API_KEY}"
     return f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:{metodo}?key={GEMINI_API_KEY}"
 
 def limpiar_texto(txt):
@@ -93,7 +91,7 @@ def intentar_modelo_veo(modelo, prompt_veo, salida_mp4):
     url = url_gemini(modelo, "predictLongRunning")
     payload = json.dumps({
         "instances": [{"prompt": prompt_veo}],
-        "parameters": {"aspectRatio": "9:16", "durationSeconds": 6}
+        "parameters": {"aspectRatio": "9:16"}
     }).encode("utf-8")
     req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=30) as res:
@@ -103,20 +101,12 @@ def intentar_modelo_veo(modelo, prompt_veo, salida_mp4):
         return False
 
     print(f"Operación Veo iniciada ({modelo}): {op_name}")
-    poll_base = "https://aiplatform.googleapis.com/v1" if es_clave_vertex() else "https://generativelanguage.googleapis.com/v1beta"
+    poll_base = "https://generativelanguage.googleapis.com/v1beta"
 
     for _ in range(22):
         time.sleep(8)
-        if es_clave_vertex():
-            poll_url = f"{poll_base}/publishers/google/models/{modelo}:fetchPredictOperation?key={GEMINI_API_KEY}"
-            poll_req = urllib.request.Request(
-                poll_url,
-                data=json.dumps({"operationName": op_name}).encode("utf-8"),
-                headers={"Content-Type": "application/json"}
-            )
-        else:
-            poll_url = f"{poll_base}/{op_name}?key={GEMINI_API_KEY}"
-            poll_req = urllib.request.Request(poll_url)
+        poll_url = f"{poll_base}/{op_name}?key={GEMINI_API_KEY}"
+        poll_req = urllib.request.Request(poll_url)
 
         with urllib.request.urlopen(poll_req, timeout=30) as p_res:
             status = json.loads(p_res.read().decode("utf-8"))
@@ -126,13 +116,6 @@ def intentar_modelo_veo(modelo, prompt_veo, salida_mp4):
                 print(f"Error interno en operación {modelo}:", status["error"])
                 return False
             resp_obj = status.get("response", {})
-            videos_vertex = resp_obj.get("videos", [])
-            if videos_vertex and videos_vertex[0].get("bytesBase64Encoded"):
-                with open(salida_mp4, "wb") as f:
-                    f.write(base64.b64decode(videos_vertex[0]["bytesBase64Encoded"]))
-                print(f"Escena IA guardada desde {modelo} ({os.path.getsize(salida_mp4)} bytes).")
-                return os.path.getsize(salida_mp4) > 50000
-
             samples = (
                 resp_obj.get("generateVideoResponse", {}).get("generatedSamples", [])
                 or resp_obj.get("generatedVideos", [])
@@ -143,6 +126,7 @@ def intentar_modelo_veo(modelo, prompt_veo, salida_mp4):
                     sep = "&" if "?" in vid_uri else "?"
                     dl_url = f"{vid_uri}{sep}key={GEMINI_API_KEY}"
                     urllib.request.urlretrieve(dl_url, salida_mp4)
+                    print(f"Escena IA descargada desde {modelo} ({os.path.getsize(salida_mp4)} bytes).")
                     return os.path.exists(salida_mp4) and os.path.getsize(salida_mp4) > 50000
             print("Respuesta Veo sin bytes:", json.dumps(resp_obj)[:400])
             return False
@@ -154,7 +138,7 @@ def generar_clip_veo(prompt_veo, salida_mp4):
 
     for modelo in ["veo-3.0-generate-001", "veo-2.0-generate-001"]:
         try:
-            print(f"Probando generación IA con {modelo} (Vertex={es_clave_vertex()}): {prompt_veo}")
+            print(f"Probando generación IA con {modelo}: {prompt_veo}")
             if intentar_modelo_veo(modelo, prompt_veo, salida_mp4):
                 return True
         except urllib.error.HTTPError as he:
@@ -173,7 +157,6 @@ def formatear_srt_alternado(srt_crudo):
             num = lineas[0]
             tiempo = lineas[1]
             texto = " ".join(lineas[2:])
-            # Alternar blanco (&H00FFFFFF) y amarillo (&H0000FFFF en formato BGR de ASS)
             if idx % 2 == 1:
                 texto = f"{{\\c&H00FFFF&}}{texto}{{\\c&HFFFFFF&}}"
             resultado.append(f"{num}\n{tiempo}\n{texto}")
@@ -260,7 +243,7 @@ def main():
     prompt_edicion = payload.get("prompt_edicion", "")
     clip_ids = payload.get("clip_file_ids", [])
 
-    print(f"Iniciando render ID={row_id} | Producto={producto} | VertexKey={es_clave_vertex()} | Clips={len(clip_ids)}")
+    print(f"Iniciando render ID={row_id} | Producto={producto} | Clips={len(clip_ids)}")
 
     os.makedirs("work", exist_ok=True)
     clips_norm = []
