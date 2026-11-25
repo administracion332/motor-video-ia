@@ -260,7 +260,6 @@ def crear_outro_logo_3d(salida_mp4, font_bold, duracion=3.0):
     ruta_logo = buscar_archivo_logo()
     if ruta_logo:
         print(f"Preparando outro 3D profesional con logo: {ruta_logo}")
-        # Componemos el logo centrado sobre fondo negro puro en 1080x1920 para pasarlo a Veo 3.1
         logo_card_jpg = "work/logo_card_9x16.jpg"
         subprocess.run([
             "ffmpeg", "-y",
@@ -294,7 +293,6 @@ def crear_outro_logo_3d(salida_mp4, font_bold, duracion=3.0):
             print("Outro 3D del logo generado con Veo 3.1 Fast OK.")
             return
 
-        # Respaldo cinematografico en FFmpeg (zoom-in progresivo + fundido limpio)
         subprocess.run([
             "ffmpeg", "-y",
             "-loop", "1", "-t", str(duracion), "-i", logo_card_jpg,
@@ -531,29 +529,29 @@ def main():
     yt_mp4 = "work/final_yt.mp4"
     wa_mp4 = "work/final_wa.mp4"
 
-    # 1) Instagram / TikTok (1080x1920 vertical)
+    # 1) Instagram / TikTok (1080x1920 vertical optimizado < 18 MB)
     subprocess.run([
         "ffmpeg", "-y", "-i", unido_mp4, "-vf", vf_final,
-        "-c:v", "libx264", "-preset", "fast", "-crf", "19", "-maxrate", "6500k", "-bufsize", "13000k",
-        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", ig_mp4
+        "-c:v", "libx264", "-preset", "fast", "-crf", "21", "-maxrate", "4500k", "-bufsize", "9000k",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "144k", "-movflags", "+faststart", ig_mp4
     ], check=True)
 
-    # 2) YouTube (1920x1080 horizontal 16:9 con fondo difuminado elegante + video central nitido)
+    # 2) YouTube (1280x720 HD horizontal 16:9 con fondo difuminado elegante, liviano < 15 MB)
     subprocess.run([
         "ffmpeg", "-y", "-i", ig_mp4,
         "-filter_complex",
-        "[0:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,boxblur=25:5,eq=brightness=-0.15[bg];"
-        "[0:v]scale=-2:1080[fg];"
+        "[0:v]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,boxblur=20:4,eq=brightness=-0.15[bg];"
+        "[0:v]scale=-2:720[fg];"
         "[bg][fg]overlay=(W-w)/2:0[vyt]",
         "-map", "[vyt]", "-map", "0:a",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-maxrate", "6000k", "-bufsize", "12000k",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "21", "-maxrate", "3800k", "-bufsize", "7600k",
         "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", yt_mp4
     ], check=True)
 
-    # 3) WhatsApp (720x1280 liviano)
+    # 3) WhatsApp (720x1280 liviano < 6 MB)
     subprocess.run([
         "ffmpeg", "-y", "-i", ig_mp4, "-vf", "scale=720:1280",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "24", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", wa_mp4
     ], check=True)
 
@@ -567,25 +565,42 @@ def main():
         with open(path, "rb") as f:
             return base64.b64encode(f.read()).decode("utf-8")
 
-    payload_vuelta = json.dumps({
+    def enviar_a_apps_script(datos_dict, etiqueta):
+        body = json.dumps(datos_dict).encode("utf-8")
+        print(f"Enviando {etiqueta} a Apps Script ({len(body)/1024/1024:.1f} MB)...")
+        req_back = urllib.request.Request(
+            APPS_SCRIPT_URL,
+            data=body,
+            headers={"Content-Type": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(req_back, timeout=90) as resp_back:
+                print(f"Respuesta Apps Script ({etiqueta}):", resp_back.read().decode("utf-8", errors="ignore")[:400])
+        except urllib.error.HTTPError as he:
+            print(f"Error HTTP Apps Script ({etiqueta}):", he.code)
+            try:
+                print(he.read().decode("utf-8", errors="ignore")[:400])
+            except Exception:
+                pass
+            raise
+
+    # Envio 1: IG/TikTok + WhatsApp
+    enviar_a_apps_script({
         "accion": "guardar_videos",
         "id": row_id,
         "ig_tiktok_b64": a_b64(ig_mp4),
-        "youtube_b64": a_b64(yt_mp4),
+        "youtube_b64": "",
         "whatsapp_b64": a_b64(wa_mp4)
-    }).encode("utf-8")
+    }, "IG_TikTok + WhatsApp")
 
-    req_back = urllib.request.Request(
-        APPS_SCRIPT_URL,
-        data=payload_vuelta,
-        headers={"Content-Type": "application/json"}
-    )
-    try:
-        with urllib.request.urlopen(req_back, timeout=120) as resp_back:
-            print("Respuesta Apps Script:", resp_back.read().decode("utf-8"))
-    except urllib.error.HTTPError as he:
-        print("Error HTTP Apps Script:", he.code, he.read().decode("utf-8", errors="ignore"))
-        raise
+    # Envio 2: YouTube 16:9 por separado para no superar el limite de 50 MB de Apps Script
+    enviar_a_apps_script({
+        "accion": "guardar_videos",
+        "id": row_id,
+        "ig_tiktok_b64": "",
+        "youtube_b64": a_b64(yt_mp4),
+        "whatsapp_b64": ""
+    }, "YouTube 16:9")
 
 if __name__ == "__main__":
     main()
