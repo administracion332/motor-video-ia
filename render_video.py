@@ -62,7 +62,7 @@ def descargar_drive(file_id, destino):
             f.write(html_o_bin)
 
 def interpretar_prompt_edicion(prompt_edicion, producto):
-    plan = {"generar_broll_ia": False, "posicion_broll": 1, "prompt_veo": ""}
+    plan = {"generar_broll_ia": False, "prompt_veo": ""}
     if not prompt_edicion or not str(prompt_edicion).strip():
         return plan
 
@@ -75,23 +75,55 @@ def interpretar_prompt_edicion(prompt_edicion, producto):
     if any(k in p_low for k in palabras_clave):
         plan["generar_broll_ia"] = True
 
+    p_prod = producto.lower()
+    if "robot" in p_prod or "chef" in p_prod or "procesadora" in p_prod:
+        desc_visual = (
+            "modern all-in-one thermal cooking food processor robot with a stainless steel bowl, "
+            "digital touchscreen display on the base, transparent lid, and internal blades actively "
+            "chopping and sautéing colorful fresh vegetables with gentle steam, NOT a stand mixer, NOT a planetary mixer"
+        )
+    else:
+        desc_visual = f"modern {producto} actively operating and demonstrating its main function"
+
     plan["prompt_veo"] = (
-        f"Vertical 9:16 photorealistic commercial close-up video showing a modern {producto} "
-        f"actively working and operating in a bright modern setting, "
-        f"smooth cinematic camera movement, natural lighting, no text or watermarks"
+        f"Vertical 9:16 photorealistic commercial close-up video of a {desc_visual} "
+        f"on a clean modern kitchen countertop, smooth cinematic slow push-in camera movement, "
+        f"bright natural daylight, sharp focus, completely silent video without any voice, speech, text, logos, or watermarks."
     )
     return plan
 
-def intentar_modelo_veo(modelo, prompt_veo, salida_mp4):
+def extraer_frame_referencia(clips_norm, salida_jpg):
+    # Extrae un frame del medio del segundo o tercer clip (donde suelen mostrar la caja/producto)
+    clip_ref = clips_norm[1] if len(clips_norm) > 1 else clips_norm[0]
+    subprocess.run([
+        "ffmpeg", "-y", "-ss", "00:00:02", "-i", clip_ref,
+        "-frames:v", "1", "-q:v", "2", salida_jpg
+    ], check=True)
+    if os.path.exists(salida_jpg) and os.path.getsize(salida_jpg) > 10000:
+        with open(salida_jpg, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
+    return ""
+
+def intentar_modelo_veo(modelo, prompt_veo, salida_mp4, img_ref_b64=""):
     token = obtener_token_vertex()
     url = url_vertex(modelo, "predictLongRunning", location="us-central1")
+    instancia = {"prompt": prompt_veo}
+    if img_ref_b64:
+        instancia["image"] = {
+            "bytesBase64Encoded": img_ref_b64,
+            "mimeType": "image/jpeg"
+        }
+
     payload = json.dumps({
-        "instances": [{"prompt": prompt_veo}],
+        "instances": [instancia],
         "parameters": {
             "aspectRatio": "9:16",
-            "sampleCount": 1
+            "sampleCount": 1,
+            "generateAudio": False,
+            "durationSeconds": 6
         }
     }).encode("utf-8")
+
     req = urllib.request.Request(
         url,
         data=payload,
@@ -140,20 +172,35 @@ def intentar_modelo_veo(modelo, prompt_veo, salida_mp4):
             return False
     return False
 
-def generar_clip_veo(prompt_veo, salida_mp4):
+def generar_clip_veo(prompt_veo, salida_mp4, img_ref_b64=""):
     if not prompt_veo:
         return False
-    for modelo in ["veo-3.1-fast-generate-001", "veo-3.1-generate-001", "veo-3.1-lite-generate-001", "veo-2.0-generate-001"]:
+    for modelo in ["veo-3.1-fast-generate-001", "veo-3.1-generate-001", "veo-3.1-lite-generate-001"]:
         try:
-            print(f"Probando generación IA en Vertex con {modelo}...")
-            if intentar_modelo_veo(modelo, prompt_veo, salida_mp4):
+            print(f"Probando generación IA en Vertex con {modelo} (con imagen ref: {bool(img_ref_b64)})...")
+            if intentar_modelo_veo(modelo, prompt_veo, salida_mp4, img_ref_b64):
                 return True
         except urllib.error.HTTPError as he:
             detalle = he.read().decode("utf-8", errors="ignore")
             print(f"HTTP Error en {modelo} ({he.code}): {detalle[:300]}")
+            # Si rechaza image-to-video por seguridad/filtro, reintentamos solo con texto
+            if img_ref_b64 and he.code == 400:
+                try:
+                    if intentar_modelo_veo(modelo, prompt_veo, salida_mp4, ""):
+                        return True
+                except Exception as e2:
+                    print(f"Reintento texto en {modelo} fallo: {e2}")
         except Exception as e:
             print(f"Excepción en {modelo}: {e}")
     return False
+
+def obtener_duracion(ruta_mp4):
+    cmd = [
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", ruta_mp4
+    ]
+    out = subprocess.check_output(cmd).decode("utf-8").strip()
+    return float(out)
 
 def seg_a_srt_time(segundos):
     ms = int(round((segundos - int(segundos)) * 1000))
@@ -163,15 +210,26 @@ def seg_a_srt_time(segundos):
     sec = s % 60
     return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
 
-def transcribir_audio_local_whisper(video_mp4, ruta_srt):
+def transcribir_audio_local_whisper(video_mp4, ruta_srt, producto=""):
     audio_wav = "work/audio_whisper.wav"
     subprocess.run([
         "ffmpeg", "-y", "-i", video_mp4, "-vn", "-ac", "1", "-ar", "16000", audio_wav
     ], check=True)
 
-    print("Cargando modelo Whisper local para transcribir audio...")
-    model = whisper.load_model("base")
-    result = model.transcribe(audio_wav, language="es", word_timestamps=True)
+    print("Cargando modelo Whisper medium para transcripcion precisa...")
+    model = whisper.load_model("medium")
+    vocabulario_guia = (
+        f"Hola, bienvenidos a Casa Dion. Hoy les presentamos {producto}. "
+        f"Telefunken, modelo 9028, robot chef de cocina multifunción, pantalla digital, "
+        f"vaso de acero inoxidable, vaporera, amasa, pica, cocina al vapor, cuotas sin interés, envíos a todo el país."
+    )
+    result = model.transcribe(
+        audio_wav,
+        language="es",
+        word_timestamps=True,
+        initial_prompt=vocabulario_guia,
+        condition_on_previous_text=False
+    )
 
     bloques = []
     idx_bloque = 1
@@ -205,7 +263,7 @@ def transcribir_audio_local_whisper(video_mp4, ruta_srt):
         srt_final = "\n\n".join(bloques) + "\n"
         with open(ruta_srt, "w", encoding="utf-8") as f:
             f.write(srt_final)
-        print(f"Subtitulos Whisper generados OK ({len(bloques)} bloques).")
+        print(f"Subtitulos Whisper medium generados OK ({len(bloques)} bloques).")
         return True
 
     print("No se detecto voz en el audio.")
@@ -252,33 +310,53 @@ def main():
         except Exception as e:
             print(f"Error en clip {idx}: {e}")
 
-    plan = interpretar_prompt_edicion(prompt_edicion, producto)
-    if plan.get("generar_broll_ia"):
-        veo_raw = "work/veo_raw.mp4"
-        veo_norm = "work/veo_norm.mp4"
-        if generar_clip_veo(plan.get("prompt_veo", ""), veo_raw):
-            subprocess.run([
-                "ffmpeg", "-y", "-i", veo_raw, "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-                "-shortest", "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30,format=yuv420p",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "19", "-c:a", "aac", "-b:a", "160k", veo_norm
-            ], check=True)
-            pos = min(max(1, int(plan.get("posicion_broll", 1))), len(clips_norm))
-            clips_norm.insert(pos, veo_norm)
-            print(f"Escena IA insertada en posición {pos}.")
-
     if not clips_norm:
         raise RuntimeError("No se encontraron clips validos.")
 
+    # Primero unimos los clips reales de las chicas (con sus voces originales intactas)
     concat_txt = "work/lista.txt"
     with open(concat_txt, "w", encoding="utf-8") as f:
         for c in clips_norm:
             f.write(f"file '{os.path.abspath(c)}'\n")
 
-    unido_mp4 = "work/unido.mp4"
+    unido_real_mp4 = "work/unido_real.mp4"
     subprocess.run([
         "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_txt,
-        "-c", "copy", unido_mp4
+        "-c", "copy", unido_real_mp4
     ], check=True)
+
+    unido_mp4 = unido_real_mp4
+
+    # Si corresponde escena IA, la ponemos AL FINAL superponiendo la imagen de Veo sobre los ultimos segundos de la voz de la chica
+    plan = interpretar_prompt_edicion(prompt_edicion, producto)
+    if plan.get("generar_broll_ia"):
+        veo_raw = "work/veo_raw.mp4"
+        veo_norm = "work/veo_norm.mp4"
+        img_ref_b64 = extraer_frame_referencia(clips_norm, "work/ref_prod.jpg")
+        if generar_clip_veo(plan.get("prompt_veo", ""), veo_raw, img_ref_b64):
+            subprocess.run([
+                "ffmpeg", "-y", "-i", veo_raw,
+                "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30,format=yuv420p",
+                "-an", "-c:v", "libx264", "-preset", "fast", "-crf", "19", veo_norm
+            ], check=True)
+
+            dur_real = obtener_duracion(unido_real_mp4)
+            dur_veo = obtener_duracion(veo_norm)
+            # Reemplazamos los ultimos segundos de imagen por el clip de Veo, manteniendo SIEMPRE la voz de la chica
+            if dur_real > dur_veo + 3.0:
+                inicio_broll = dur_real - dur_veo
+                unido_broll_mp4 = "work/unido_broll.mp4"
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", unido_real_mp4, "-i", veo_norm,
+                    "-filter_complex",
+                    f"[1:v]setpts=PTS-STARTPTS+{inicio_broll}/TB[v_ia];"
+                    f"[0:v][v_ia]overlay=0:0:enable='between(t,{inicio_broll},{dur_real})'[vout]",
+                    "-map", "[vout]", "-map", "0:a",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "19",
+                    "-c:a", "copy", unido_broll_mp4
+                ], check=True)
+                unido_mp4 = unido_broll_mp4
+                print(f"Escena IA aplicada como B-roll final desde {inicio_broll:.1f}s manteniendo voz original.")
 
     font_bold = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
     if not os.path.exists(font_bold):
@@ -290,7 +368,7 @@ def main():
     ]
 
     ruta_srt = "work/subtitulos.srt"
-    if transcribir_audio_local_whisper(unido_mp4, ruta_srt):
+    if transcribir_audio_local_whisper(unido_mp4, ruta_srt, producto):
         estilo_sub = (
             "FontName=Liberation Sans,FontSize=15,Bold=1,"
             "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H00000000,"
