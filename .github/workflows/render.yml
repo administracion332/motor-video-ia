@@ -11,13 +11,13 @@ jobs:
       - name: Descargar codigo del repositorio
         uses: actions/checkout@v4
 
-      - name: Instalar Python, FFmpeg y tipografias
+      - name: Instalar Python, FFmpeg, Whisper y tipografias
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg fonts-liberation fonts-dejavu-core
-          pip install --upgrade google-auth requests
+          pip install --upgrade google-auth requests openai-whisper
 
-      - name: Generar videos con FFmpeg y Gemini
+      - name: Generar videos con FFmpeg, Whisper y Veo
         env:
           APPS_SCRIPT_URL: ${{ secrets.APPS_SCRIPT_URL }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
