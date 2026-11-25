@@ -143,7 +143,7 @@ def intentar_modelo_veo(modelo, prompt_veo, salida_mp4):
 def generar_clip_veo(prompt_veo, salida_mp4):
     if not prompt_veo:
         return False
-    for modelo in ["veo-2.0-generate-001", "veo-3.0-generate-001", "veo-3.0-fast-generate-001"]:
+    for modelo in ["veo-3.1-fast-generate-001", "veo-3.1-generate-001", "veo-3.1-lite-generate-001", "veo-2.0-generate-001"]:
         try:
             print(f"Probando generación IA en Vertex con {modelo}...")
             if intentar_modelo_veo(modelo, prompt_veo, salida_mp4):
@@ -189,7 +189,6 @@ def transcribir_audio_local_whisper(video_mp4, ruta_srt):
                 idx_bloque += 1
             continue
 
-        # Agrupar de a 4 palabras para subtitulos dinamicos tipo Reels/TikTok
         for i in range(0, len(palabras), 4):
             grupo = palabras[i:i+4]
             texto = " ".join(w["word"].strip() for w in grupo).strip()
